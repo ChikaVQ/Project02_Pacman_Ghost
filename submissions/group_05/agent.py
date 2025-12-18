@@ -97,6 +97,13 @@ class PacmanAgent(BasePacmanAgent):
         # Lưu vài vị trí gần đây để tránh loop ngắn
         self.prev_positions = deque(maxlen=8)
 
+        # ============================
+        # BELIEF TRACKING (Tâm)
+        # ============================
+        # Belief map: xác suất enemy có thể ở đâu khi không nhìn thấy
+        self.belief_map = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+        self.belief_decay = 0.95  # Hệ số giảm belief khi lan truyền
+
         seed = kwargs.get("seed", None)
         self.rng = random.Random(seed)
 
@@ -119,6 +126,9 @@ class PacmanAgent(BasePacmanAgent):
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
             self.last_seen_step = step_number
+
+        # 3b) Update belief map (Tâm's work)
+        self._update_belief(map_state, my_position, enemy_position)
 
         self.prev_positions.append(my_position)
 
@@ -382,6 +392,118 @@ class PacmanAgent(BasePacmanAgent):
         moves.sort(key=score)
         return moves
 
+    # ============================
+    # BELIEF TRACKING (Tâm's work)
+    # ============================
+
+    def _update_belief(self, obs: np.ndarray, my_pos: tuple, enemy_pos: tuple):
+        """
+        Cập nhật belief map:
+        - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
+        - Nếu enemy_pos == None:
+            + Lan truyền belief sang các ô kề (random-walk)
+            + Mask belief = 0 tại các ô Pacman quan sát mà không thấy enemy
+        """
+        if enemy_pos is not None:
+            # Thấy enemy -> reset belief, chỉ tập trung vào vị trí đó
+            self.belief_map.fill(0.0)
+            r, c = enemy_pos
+            if in_bounds(r, c):
+                self.belief_map[r, c] = 1.0
+        else:
+            # Không thấy enemy -> lan truyền belief
+            if np.sum(self.belief_map) > 0:
+                self._propagate_belief()
+            else:
+                # Chưa có thông tin gì -> khởi tạo belief đồng đều vào các ô không phải tường
+                for r in range(GRID_H):
+                    for c in range(GRID_W):
+                        if self.memory_map[r, c] != 1:  # không phải tường
+                            self.belief_map[r, c] = 1.0
+                # Normalize
+                total = np.sum(self.belief_map)
+                if total > 0:
+                    self.belief_map /= total
+
+            # Mask các ô Pacman quan sát mà không thấy enemy
+            # obs != -1 là các ô nhìn thấy
+            visible = obs != -1
+            self.belief_map[visible] = 0.0
+
+            # Normalize lại belief
+            total = np.sum(self.belief_map)
+            if total > 0:
+                self.belief_map /= total
+
+    def _propagate_belief(self):
+        """
+        Lan truyền belief theo mô hình random-walk:
+        Mỗi ô có belief sẽ phân phối đều cho các ô kề có thể đi được
+        """
+        new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                if self.belief_map[r, c] <= 0:
+                    continue
+
+                # Tìm các ô kề có thể đi được
+                neighbors = []
+                for _, (dr, dc) in DIRS:
+                    nr, nc = r + dr, c + dc
+                    if self._walkable(nr, nc, allow_unknown=True):
+                        neighbors.append((nr, nc))
+
+                # Phân phối belief cho các ô kề (random walk)
+                if len(neighbors) > 0:
+                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(neighbors)
+                    for nr, nc in neighbors:
+                        new_belief[nr, nc] += distributed_belief
+
+        self.belief_map = new_belief
+
+        # Normalize
+        total = np.sum(self.belief_map)
+        if total > 0:
+            self.belief_map /= total
+
+    def get_belief_target(self) -> tuple:
+        """
+        API cho Pacman: trả về vị trí có belief cao nhất
+        Dùng khi mất dấu enemy để biết nên đi tìm ở đâu
+        """
+        if np.sum(self.belief_map) <= 0:
+            return None
+
+        # Tìm ô có belief cao nhất
+        max_belief = np.max(self.belief_map)
+        if max_belief <= 0:
+            return None
+
+        # Lấy tất cả các ô có belief gần bằng max (trong trường hợp có nhiều ô)
+        candidates = []
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                if self.belief_map[r, c] >= max_belief * 0.95:  # 95% của max
+                    candidates.append((r, c))
+
+        if not candidates:
+            return None
+
+        # Chọn ô gần nhất với last_known (nếu có)
+        if self.last_known_enemy_pos is not None:
+            candidates.sort(key=lambda pos: manhattan(pos, self.last_known_enemy_pos))
+            return candidates[0]
+
+        return candidates[0]
+
+    def get_danger_map(self) -> np.ndarray:
+        """
+        API cho Ghost: trả về danger map dựa trên belief
+        Các ô có belief cao = nguy hiểm cho Ghost
+        """
+        return self.belief_map.copy()
+
 
 # ============================
 # GHOST AGENT (HIDER)
@@ -408,6 +530,13 @@ class GhostAgent(BaseGhostAgent):
         self.last_known_enemy_pos = None
         self.prev_positions = deque(maxlen=8)
 
+        # ============================
+        # BELIEF TRACKING (Tâm)
+        # ============================
+        # Belief map: xác suất Pacman có thể ở đâu khi không nhìn thấy
+        self.belief_map = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+        self.belief_decay = 0.95  # Hệ số giảm belief khi lan truyền
+
         seed = kwargs.get("seed", None)
         self.rng = random.Random(seed)
 
@@ -430,6 +559,9 @@ class GhostAgent(BaseGhostAgent):
         # 3) Update threat memory
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
+
+        # 3b) Update belief map (Tâm's work)
+        self._update_belief(map_state, my_position, enemy_position)
 
         self.prev_positions.append(my_position)
 
@@ -589,3 +721,115 @@ class GhostAgent(BaseGhostAgent):
 
         moves.sort(key=score)
         return moves
+
+    # ============================
+    # BELIEF TRACKING (Tâm's work)
+    # ============================
+
+    def _update_belief(self, obs: np.ndarray, my_pos: tuple, enemy_pos: tuple):
+        """
+        Cập nhật belief map:
+        - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
+        - Nếu enemy_pos == None:
+            + Lan truyền belief sang các ô kề (random-walk)
+            + Mask belief = 0 tại các ô Ghost quan sát mà không thấy Pacman
+        """
+        if enemy_pos is not None:
+            # Thấy Pacman -> reset belief, chỉ tập trung vào vị trí đó
+            self.belief_map.fill(0.0)
+            r, c = enemy_pos
+            if in_bounds(r, c):
+                self.belief_map[r, c] = 1.0
+        else:
+            # Không thấy Pacman -> lan truyền belief
+            if np.sum(self.belief_map) > 0:
+                self._propagate_belief()
+            else:
+                # Chưa có thông tin gì -> khởi tạo belief đồng đều vào các ô không phải tường
+                for r in range(GRID_H):
+                    for c in range(GRID_W):
+                        if self.memory_map[r, c] != 1:  # không phải tường
+                            self.belief_map[r, c] = 1.0
+                # Normalize
+                total = np.sum(self.belief_map)
+                if total > 0:
+                    self.belief_map /= total
+
+            # Mask các ô Ghost quan sát mà không thấy Pacman
+            # obs != -1 là các ô nhìn thấy
+            visible = obs != -1
+            self.belief_map[visible] = 0.0
+
+            # Normalize lại belief
+            total = np.sum(self.belief_map)
+            if total > 0:
+                self.belief_map /= total
+
+    def _propagate_belief(self):
+        """
+        Lan truyền belief theo mô hình random-walk:
+        Mỗi ô có belief sẽ phân phối đều cho các ô kề có thể đi được
+        """
+        new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                if self.belief_map[r, c] <= 0:
+                    continue
+
+                # Tìm các ô kề có thể đi được
+                neighbors = []
+                for _, (dr, dc) in DIRS:
+                    nr, nc = r + dr, c + dc
+                    if self._walkable(nr, nc):
+                        neighbors.append((nr, nc))
+
+                # Phân phối belief cho các ô kề (random walk)
+                if len(neighbors) > 0:
+                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(neighbors)
+                    for nr, nc in neighbors:
+                        new_belief[nr, nc] += distributed_belief
+
+        self.belief_map = new_belief
+
+        # Normalize
+        total = np.sum(self.belief_map)
+        if total > 0:
+            self.belief_map /= total
+
+    def get_belief_target(self) -> tuple:
+        """
+        API cho Ghost: trả về vị trí có belief cao nhất
+        (Pacman có thể ở đâu) để Ghost tránh xa
+        """
+        if np.sum(self.belief_map) <= 0:
+            return None
+
+        # Tìm ô có belief cao nhất
+        max_belief = np.max(self.belief_map)
+        if max_belief <= 0:
+            return None
+
+        # Lấy tất cả các ô có belief gần bằng max
+        candidates = []
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                if self.belief_map[r, c] >= max_belief * 0.95:
+                    candidates.append((r, c))
+
+        if not candidates:
+            return None
+
+        # Chọn ô gần nhất với last_known (nếu có)
+        if self.last_known_enemy_pos is not None:
+            candidates.sort(key=lambda pos: manhattan(pos, self.last_known_enemy_pos))
+            return candidates[0]
+
+        return candidates[0]
+
+    def get_danger_map(self) -> np.ndarray:
+        """
+        API cho Ghost: trả về danger map dựa trên belief
+        Các ô có belief cao = nguy hiểm cho Ghost (Pacman có thể ở đó)
+        """
+        return self.belief_map.copy()
