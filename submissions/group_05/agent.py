@@ -401,8 +401,9 @@ class PacmanAgent(BasePacmanAgent):
         Cập nhật belief map:
         - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
         - Nếu enemy_pos == None:
-            + Lan truyền belief sang các ô kề (random-walk)
+            + Lan truyền belief sang các ô kề (random-walk) + khả năng đứng yên
             + Mask belief = 0 tại các ô Pacman quan sát mà không thấy enemy
+            + Mask belief = 0 tại các ô tường đã biết
         """
         if enemy_pos is not None:
             # Thấy enemy -> reset belief, chỉ tập trung vào vị trí đó
@@ -430,6 +431,10 @@ class PacmanAgent(BasePacmanAgent):
             visible = obs != -1
             self.belief_map[visible] = 0.0
 
+            # Mask các ô tường đã biết trong memory_map (FIX Điểm 3)
+            walls = self.memory_map == 1
+            self.belief_map[walls] = 0.0
+
             # Normalize lại belief
             total = np.sum(self.belief_map)
             if total > 0:
@@ -438,7 +443,9 @@ class PacmanAgent(BasePacmanAgent):
     def _propagate_belief(self):
         """
         Lan truyền belief theo mô hình random-walk:
-        Mỗi ô có belief sẽ phân phối đều cho các ô kề có thể đi được
+        Mỗi ô có belief sẽ phân phối đều cho:
+          - Các ô kề có thể đi được
+          - Chính vị trí đó (enemy có thể đứng yên - FIX Điểm 1)
         """
         new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
 
@@ -447,18 +454,18 @@ class PacmanAgent(BasePacmanAgent):
                 if self.belief_map[r, c] <= 0:
                     continue
 
-                # Tìm các ô kề có thể đi được
-                neighbors = []
+                # Tìm các ô có thể đến: bao gồm các ô kề + chính vị trí hiện tại (STAY)
+                possible_positions = [(r, c)]  # Thêm vị trí hiện tại (enemy có thể đứng yên)
                 for _, (dr, dc) in DIRS:
                     nr, nc = r + dr, c + dc
                     if self._walkable(nr, nc, allow_unknown=True):
-                        neighbors.append((nr, nc))
+                        possible_positions.append((nr, nc))
 
-                # Phân phối belief cho các ô kề (random walk)
-                if len(neighbors) > 0:
-                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(neighbors)
-                    for nr, nc in neighbors:
-                        new_belief[nr, nc] += distributed_belief
+                # Phân phối belief đều cho tất cả vị trí có thể
+                if len(possible_positions) > 0:
+                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(possible_positions)
+                    for pr, pc in possible_positions:
+                        new_belief[pr, pc] += distributed_belief
 
         self.belief_map = new_belief
 
@@ -731,8 +738,9 @@ class GhostAgent(BaseGhostAgent):
         Cập nhật belief map:
         - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
         - Nếu enemy_pos == None:
-            + Lan truyền belief sang các ô kề (random-walk)
+            + Lan truyền belief sang các ô kề (random-walk) + khả năng đứng yên
             + Mask belief = 0 tại các ô Ghost quan sát mà không thấy Pacman
+            + Mask belief = 0 tại các ô tường đã biết
         """
         if enemy_pos is not None:
             # Thấy Pacman -> reset belief, chỉ tập trung vào vị trí đó
@@ -760,6 +768,10 @@ class GhostAgent(BaseGhostAgent):
             visible = obs != -1
             self.belief_map[visible] = 0.0
 
+            # Mask các ô tường đã biết trong memory_map (FIX Điểm 3)
+            walls = self.memory_map == 1
+            self.belief_map[walls] = 0.0
+
             # Normalize lại belief
             total = np.sum(self.belief_map)
             if total > 0:
@@ -768,7 +780,9 @@ class GhostAgent(BaseGhostAgent):
     def _propagate_belief(self):
         """
         Lan truyền belief theo mô hình random-walk:
-        Mỗi ô có belief sẽ phân phối đều cho các ô kề có thể đi được
+        Mỗi ô có belief sẽ phân phối đều cho:
+          - Các ô kề có thể đi được
+          - Chính vị trí đó (Pacman có thể đứng yên - FIX Điểm 1)
         """
         new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
 
@@ -777,18 +791,18 @@ class GhostAgent(BaseGhostAgent):
                 if self.belief_map[r, c] <= 0:
                     continue
 
-                # Tìm các ô kề có thể đi được
-                neighbors = []
+                # Tìm các ô có thể đến: bao gồm các ô kề + chính vị trí hiện tại (STAY)
+                possible_positions = [(r, c)]  # Thêm vị trí hiện tại (Pacman có thể đứng yên)
                 for _, (dr, dc) in DIRS:
                     nr, nc = r + dr, c + dc
                     if self._walkable(nr, nc):
-                        neighbors.append((nr, nc))
+                        possible_positions.append((nr, nc))
 
-                # Phân phối belief cho các ô kề (random walk)
-                if len(neighbors) > 0:
-                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(neighbors)
-                    for nr, nc in neighbors:
-                        new_belief[nr, nc] += distributed_belief
+                # Phân phối belief đều cho tất cả vị trí có thể
+                if len(possible_positions) > 0:
+                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(possible_positions)
+                    for pr, pc in possible_positions:
+                        new_belief[pr, pc] += distributed_belief
 
         self.belief_map = new_belief
 
