@@ -97,13 +97,6 @@ class PacmanAgent(BasePacmanAgent):
         # Lưu vài vị trí gần đây để tránh loop ngắn
         self.prev_positions = deque(maxlen=8)
 
-        # ============================
-        # BELIEF TRACKING (Tâm)
-        # ============================
-        # Belief map: xác suất enemy có thể ở đâu khi không nhìn thấy
-        self.belief_map = np.zeros((GRID_H, GRID_W), dtype=np.float32)
-        self.belief_decay = 0.95  # Hệ số giảm belief khi lan truyền
-
         seed = kwargs.get("seed", None)
         self.rng = random.Random(seed)
 
@@ -126,9 +119,6 @@ class PacmanAgent(BasePacmanAgent):
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
             self.last_seen_step = step_number
-
-        # 3b) Update belief map (Tâm's work)
-        self._update_belief(map_state, my_position, enemy_position)
 
         self.prev_positions.append(my_position)
 
@@ -535,13 +525,6 @@ class GhostAgent(BaseGhostAgent):
         self.last_known_enemy_pos = None
         self.prev_positions = deque(maxlen=8)
 
-        # ============================
-        # BELIEF TRACKING (Tâm)
-        # ============================
-        # Belief map: xác suất Pacman có thể ở đâu khi không nhìn thấy
-        self.belief_map = np.zeros((GRID_H, GRID_W), dtype=np.float32)
-        self.belief_decay = 0.95  # Hệ số giảm belief khi lan truyền
-
         seed = kwargs.get("seed", None)
         self.rng = random.Random(seed)
 
@@ -564,9 +547,6 @@ class GhostAgent(BaseGhostAgent):
         # 3) Update threat memory
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
-
-        # 3b) Update belief map (Tâm's work)
-        self._update_belief(map_state, my_position, enemy_position)
 
         self.prev_positions.append(my_position)
 
@@ -627,7 +607,43 @@ class GhostAgent(BaseGhostAgent):
           + thưởng vào fog (-1)
           - phạt loop (prev_positions + visit_count)
           - phạt dead-end (degree=1), thưởng giao lộ (degree>=3)
+          - [Nguyên] phạt danger (gần Pacman)
+          - [Nguyên] phạt occlusion (cùng hàng/cột, không có tường che)
         """
+        # Nguyên: Tunable weights
+        W_DANGER = 5
+        W_OCCLUDE = 20
+        DANGER_RADIUS = 5
+        
+        # Nguyên: Helper - check line of sight (occlusion)
+        def has_line_of_sight(pos1: tuple, pos2: tuple) -> bool:
+            """Kiểm tra xem pos1 và pos2 có cùng hàng/cột trong phạm vi 5 và không có tường che."""
+            r1, c1 = pos1
+            r2, c2 = pos2
+            
+            # Phải cùng hàng hoặc cùng cột
+            if r1 != r2 and c1 != c2:
+                return False
+            
+            # Kiểm tra khoảng cách Manhattan <= 5
+            dist = abs(r1 - r2) + abs(c1 - c2)
+            if dist > 5:
+                return False
+            
+            # Kiểm tra tường giữa hai vị trí
+            if r1 == r2:  # Cùng hàng
+                c_min, c_max = (c1, c2) if c1 < c2 else (c2, c1)
+                for c in range(c_min + 1, c_max):
+                    if self.memory_map[r1, c] == 1:  # Tường chặn
+                        return False
+            else:  # Cùng cột (c1 == c2)
+                r_min, r_max = (r1, r2) if r1 < r2 else (r2, r1)
+                for r in range(r_min + 1, r_max):
+                    if self.memory_map[r, c1] == 1:  # Tường chặn
+                        return False
+            
+            return True
+        
         best_mv = Move.STAY
         best_score = None
 
@@ -660,6 +676,16 @@ class GhostAgent(BaseGhostAgent):
                 score -= 25
             elif deg >= 3:
                 score += 6
+            
+            # Nguyên: 5) Danger-aware - phạt các ô gần Pacman
+            dist_to_threat = manhattan(nxt, threat)
+            if dist_to_threat <= DANGER_RADIUS:
+                danger_penalty = (DANGER_RADIUS + 1 - dist_to_threat)
+                score -= W_DANGER * danger_penalty
+            
+            # Nguyên: 6) Occlusion - phạt nếu cùng hàng/cột với Pacman (dễ bị nhìn thấy)
+            if has_line_of_sight(nxt, threat):
+                score -= W_OCCLUDE
 
             if best_score is None or score > best_score:
                 best_score = score
@@ -696,7 +722,47 @@ class GhostAgent(BaseGhostAgent):
         return None
 
     def _ordered_moves(self, pos: tuple):
-        """Sắp xếp move theo ưu tiên: vào fog, ít loop, ít visit."""
+        """
+        Sắp xếp move theo ưu tiên: vào fog, ít loop, ít visit.
+        [Nguyên] Thêm: tránh danger và occlusion.
+        """
+        # Nguyên: Tunable weights
+        W_DANGER = 5
+        W_OCCLUDE = 20
+        DANGER_RADIUS = 5
+        
+        # Nguyên: Helper - check line of sight (occlusion)
+        def has_line_of_sight(pos1: tuple, pos2: tuple) -> bool:
+            """Kiểm tra xem pos1 và pos2 có cùng hàng/cột trong phạm vi 5 và không có tường che."""
+            r1, c1 = pos1
+            r2, c2 = pos2
+            
+            # Phải cùng hàng hoặc cùng cột
+            if r1 != r2 and c1 != c2:
+                return False
+            
+            # Kiểm tra khoảng cách Manhattan <= 5
+            dist = abs(r1 - r2) + abs(c1 - c2)
+            if dist > 5:
+                return False
+            
+            # Kiểm tra tường giữa hai vị trí
+            if r1 == r2:  # Cùng hàng
+                c_min, c_max = (c1, c2) if c1 < c2 else (c2, c1)
+                for c in range(c_min + 1, c_max):
+                    if self.memory_map[r1, c] == 1:  # Tường chặn
+                        return False
+            else:  # Cùng cột (c1 == c2)
+                r_min, r_max = (r1, r2) if r1 < r2 else (r2, r1)
+                for r in range(r_min + 1, r_max):
+                    if self.memory_map[r, c1] == 1:  # Tường chặn
+                        return False
+            
+            return True
+        
+        # Lấy vị trí threat để tính danger/occlusion
+        threat = self.last_known_enemy_pos
+        
         moves = ALL_MOVES[:]
         self.rng.shuffle(moves)
 
@@ -721,127 +787,19 @@ class GhostAgent(BaseGhostAgent):
             # phạt nếu dead-end
             if self._degree(nxt) <= 1:
                 penalty += 5
+            
+            # Nguyên: Danger-aware - phạt các ô gần Pacman
+            if threat is not None:
+                dist_to_threat = manhattan(nxt, threat)
+                if dist_to_threat <= DANGER_RADIUS:
+                    danger_penalty = (DANGER_RADIUS + 1 - dist_to_threat)
+                    penalty += W_DANGER * danger_penalty
+            
+            # Nguyên: Occlusion - phạt nếu cùng hàng/cột với Pacman (dễ bị nhìn thấy)
+            if threat is not None and has_line_of_sight(nxt, threat):
+                penalty += W_OCCLUDE
 
             return penalty
 
         moves.sort(key=score)
         return moves
-
-    # ============================
-    # BELIEF TRACKING (Tâm's work)
-    # ============================
-
-    def _update_belief(self, obs: np.ndarray, my_pos: tuple, enemy_pos: tuple):
-        """
-        Cập nhật belief map:
-        - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
-        - Nếu enemy_pos == None:
-            + Lan truyền belief sang các ô kề (random-walk) + khả năng đứng yên
-            + Mask belief = 0 tại các ô Ghost quan sát mà không thấy Pacman
-            + Mask belief = 0 tại các ô tường đã biết
-        """
-        if enemy_pos is not None:
-            # Thấy Pacman -> reset belief, chỉ tập trung vào vị trí đó
-            self.belief_map.fill(0.0)
-            r, c = enemy_pos
-            if in_bounds(r, c):
-                self.belief_map[r, c] = 1.0
-        else:
-            # Không thấy Pacman -> lan truyền belief
-            if np.sum(self.belief_map) > 0:
-                self._propagate_belief()
-            else:
-                # Chưa có thông tin gì -> khởi tạo belief đồng đều vào các ô không phải tường
-                for r in range(GRID_H):
-                    for c in range(GRID_W):
-                        if self.memory_map[r, c] != 1:  # không phải tường
-                            self.belief_map[r, c] = 1.0
-                # Normalize
-                total = np.sum(self.belief_map)
-                if total > 0:
-                    self.belief_map /= total
-
-            # Mask các ô Ghost quan sát mà không thấy Pacman
-            # obs != -1 là các ô nhìn thấy
-            visible = obs != -1
-            self.belief_map[visible] = 0.0
-
-            # Mask các ô tường đã biết trong memory_map (FIX Điểm 3)
-            walls = self.memory_map == 1
-            self.belief_map[walls] = 0.0
-
-            # Normalize lại belief
-            total = np.sum(self.belief_map)
-            if total > 0:
-                self.belief_map /= total
-
-    def _propagate_belief(self):
-        """
-        Lan truyền belief theo mô hình random-walk:
-        Mỗi ô có belief sẽ phân phối đều cho:
-          - Các ô kề có thể đi được
-          - Chính vị trí đó (Pacman có thể đứng yên - FIX Điểm 1)
-        """
-        new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
-
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if self.belief_map[r, c] <= 0:
-                    continue
-
-                # Tìm các ô có thể đến: bao gồm các ô kề + chính vị trí hiện tại (STAY)
-                possible_positions = [(r, c)]  # Thêm vị trí hiện tại (Pacman có thể đứng yên)
-                for _, (dr, dc) in DIRS:
-                    nr, nc = r + dr, c + dc
-                    if self._walkable(nr, nc):
-                        possible_positions.append((nr, nc))
-
-                # Phân phối belief đều cho tất cả vị trí có thể
-                if len(possible_positions) > 0:
-                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(possible_positions)
-                    for pr, pc in possible_positions:
-                        new_belief[pr, pc] += distributed_belief
-
-        self.belief_map = new_belief
-
-        # Normalize
-        total = np.sum(self.belief_map)
-        if total > 0:
-            self.belief_map /= total
-
-    def get_belief_target(self) -> tuple:
-        """
-        API cho Ghost: trả về vị trí có belief cao nhất
-        (Pacman có thể ở đâu) để Ghost tránh xa
-        """
-        if np.sum(self.belief_map) <= 0:
-            return None
-
-        # Tìm ô có belief cao nhất
-        max_belief = np.max(self.belief_map)
-        if max_belief <= 0:
-            return None
-
-        # Lấy tất cả các ô có belief gần bằng max
-        candidates = []
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if self.belief_map[r, c] >= max_belief * 0.95:
-                    candidates.append((r, c))
-
-        if not candidates:
-            return None
-
-        # Chọn ô gần nhất với last_known (nếu có)
-        if self.last_known_enemy_pos is not None:
-            candidates.sort(key=lambda pos: manhattan(pos, self.last_known_enemy_pos))
-            return candidates[0]
-
-        return candidates[0]
-
-    def get_danger_map(self) -> np.ndarray:
-        """
-        API cho Ghost: trả về danger map dựa trên belief
-        Các ô có belief cao = nguy hiểm cho Ghost (Pacman có thể ở đó)
-        """
-        return self.belief_map.copy()
