@@ -133,8 +133,13 @@ class PacmanAgent(BasePacmanAgent):
         self.prev_positions.append(my_position)
 
         # 4) Xác định mục tiêu: visible -> last_known -> explore
-        target = enemy_position or self.last_known_enemy_pos
-
+        target = None
+        if enemy_position is not None:
+            # Khi thấy Ghost, tìm điểm chặn thay vì đuổi thẳng tới enemy_position
+            target = self._intercept_target(my_position, enemy_position)
+        elif self.last_known_enemy_pos is not None:
+            # Nếu không thấy, đuổi tới vị trí cuối cùng nhìn thấy
+            target = self.last_known_enemy_pos
         # 4a) Có target -> BFS chase
         if target is not None:
             path = self._bfs_path(my_position, target, allow_unknown=True)
@@ -164,7 +169,6 @@ class PacmanAgent(BasePacmanAgent):
     # ============================
     # MEMORY & MOVE
     # ============================
-
     def _update_memory(self, obs: np.ndarray):
         """Ghi các ô nhìn thấy vào memory_map"""
         visible = obs != -1
@@ -180,7 +184,13 @@ class PacmanAgent(BasePacmanAgent):
         if v == -1:
             return allow_unknown
         return True  # 0
-
+    def _is_ghost_walkable(self, r: int, c: int) -> bool:
+        """
+        Kiểm tra ô có đi được (không phải tường, có thể là -1) theo logic của Ghost
+        khi Pacman đang dự đoán đường trốn của nó.
+        """
+        # Sử dụng lại _walkable với allow_unknown=True
+        return self._walkable(r, c, allow_unknown=True)
     def _can_step(self, pos: tuple, mv: Move) -> bool:
         dr, dc = mv.value
         return self._walkable(pos[0] + dr, pos[1] + dc, allow_unknown=True)
@@ -211,6 +221,15 @@ class PacmanAgent(BasePacmanAgent):
             if (dr, dc) == (r, c):
                 return mv
         return Move.STAY
+    def _pacman_time(self, d_pacman: int) -> int:
+        """
+        Tính thời gian (số bước của Ghost) cần để Pacman di chuyển d_pacman ô.
+        Dùng phép chia làm tròn lên (ceil) vì Pacman chỉ di chuyển theo đơn vị bước/lần.
+        """
+        if d_pacman <= 0:
+            return 0
+        # Chia làm tròn lên: ceil(d_pacman / pacman_speed)
+        return (d_pacman + self.pacman_speed - 1) // self.pacman_speed
 
     # ============================
     # BFS
@@ -391,126 +410,105 @@ class PacmanAgent(BasePacmanAgent):
 
         moves.sort(key=score)
         return moves
-
     # ============================
-    # BELIEF TRACKING (Tâm's work)
+    # INTERCEPT LOGIC (MỚI)
     # ============================
 
-    def _update_belief(self, obs: np.ndarray, my_pos: tuple, enemy_pos: tuple):
+    def _is_junction(self, pos: tuple) -> bool:
+        """Kiểm tra xem một vị trí có phải là giao lộ (có 3 hướng đi trở lên) không."""
+        r, c = pos
+        if not in_bounds(r, c) or self.memory_map[r, c] == 1:
+            return False
+        
+        walkable_neighbors = 0
+        for _, (dr, dc) in DIRS:
+            if self._walkable(r + dr, c + dc, allow_unknown=False):
+                walkable_neighbors += 1
+        
+        # Coi 3 hướng đi trở lên là giao lộ
+        return walkable_neighbors >= 3
+
+    def _intercept_target(self, my_pos: tuple, enemy_pos: tuple) -> tuple:
         """
-        Cập nhật belief map:
-        - Nếu enemy_pos != None: belief = 1 tại vị trí đó, các ô khác = 0
-        - Nếu enemy_pos == None:
-            + Lan truyền belief sang các ô kề (random-walk) + khả năng đứng yên
-            + Mask belief = 0 tại các ô Pacman quan sát mà không thấy enemy
-            + Mask belief = 0 tại các ô tường đã biết
+        Dự đoán Ghost chạy và chọn điểm chặn tối ưu bằng công thức Cost dựa trên THỜI GIAN.
         """
-        if enemy_pos is not None:
-            # Thấy enemy -> reset belief, chỉ tập trung vào vị trí đó
-            self.belief_map.fill(0.0)
-            r, c = enemy_pos
-            if in_bounds(r, c):
-                self.belief_map[r, c] = 1.0
-        else:
-            # Không thấy enemy -> lan truyền belief
-            if np.sum(self.belief_map) > 0:
-                self._propagate_belief()
-            else:
-                # Chưa có thông tin gì -> khởi tạo belief đồng đều vào các ô không phải tường
-                for r in range(GRID_H):
-                    for c in range(GRID_W):
-                        if self.memory_map[r, c] != 1:  # không phải tường
-                            self.belief_map[r, c] = 1.0
-                # Normalize
-                total = np.sum(self.belief_map)
-                if total > 0:
-                    self.belief_map /= total
+        max_ghost_steps = 4
+        
+        # 1. BFS từ Ghost để tìm các điểm đến và khoảng cách
+        q = deque([enemy_pos])
+        ghost_dist = {enemy_pos: 0}
+        potential_targets = [] 
 
-            # Mask các ô Pacman quan sát mà không thấy enemy
-            # obs != -1 là các ô nhìn thấy
-            visible = obs != -1
-            self.belief_map[visible] = 0.0
+        while q:
+            cur = q.popleft()
+            d_cur = ghost_dist[cur]
 
-            # Mask các ô tường đã biết trong memory_map (FIX Điểm 3)
-            walls = self.memory_map == 1
-            self.belief_map[walls] = 0.0
+            if d_cur >= max_ghost_steps:
+                continue
+            
+            # Ghi nhận các điểm chặn tiềm năng sau bước 1
+            if d_cur >= 1: 
+                 potential_targets.append(cur)
 
-            # Normalize lại belief
-            total = np.sum(self.belief_map)
-            if total > 0:
-                self.belief_map /= total
-
-    def _propagate_belief(self):
-        """
-        Lan truyền belief theo mô hình random-walk:
-        Mỗi ô có belief sẽ phân phối đều cho:
-          - Các ô kề có thể đi được
-          - Chính vị trí đó (enemy có thể đứng yên - FIX Điểm 1)
-        """
-        new_belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
-
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if self.belief_map[r, c] <= 0:
+            for _, (dr, dc) in DIRS:
+                nxt = (cur[0] + dr, cur[1] + dc)
+                if nxt in ghost_dist:
                     continue
+                
+                # SỬA ĐỔI 1: Đồng bộ hóa giả định đường đi của Ghost (cho phép đi qua -1)
+                if not self._is_ghost_walkable(nxt[0], nxt[1]): 
+                    continue
+                
+                ghost_dist[nxt] = d_cur + 1
+                q.append(nxt)
 
-                # Tìm các ô có thể đến: bao gồm các ô kề + chính vị trí hiện tại (STAY)
-                possible_positions = [(r, c)]  # Thêm vị trí hiện tại (enemy có thể đứng yên)
-                for _, (dr, dc) in DIRS:
-                    nr, nc = r + dr, c + dc
-                    if self._walkable(nr, nc, allow_unknown=True):
-                        possible_positions.append((nr, nc))
+        if not potential_targets:
+            return enemy_pos
 
-                # Phân phối belief đều cho tất cả vị trí có thể
-                if len(possible_positions) > 0:
-                    distributed_belief = self.belief_map[r, c] * self.belief_decay / len(possible_positions)
-                    for pr, pc in possible_positions:
-                        new_belief[pr, pc] += distributed_belief
+        best_target = enemy_pos
+        best_score = -float('inf')
 
-        self.belief_map = new_belief
+        for target in potential_targets:
+            d_pacman = self._bfs_dist(my_pos, target, allow_unknown=True) 
+            d_ghost = ghost_dist.get(target, -1) 
+            
+            if d_pacman < 0 or d_ghost < 0:
+                continue
+            
+            # *** BƯỚC CỐT LÕI: TÍNH THỜI GIAN VÀ COST DỰA TRÊN TỐC ĐỘ PACMAN ***
+            
+            t_pacman = self._pacman_time(d_pacman) # Thời gian của Pacman (đã tính pacman_speed)
+            t_ghost = d_ghost                     # Thời gian của Ghost (1 bước = 1 đơn vị thời gian)
+            
+            # --- Công thức Cost Tối ưu (Dựa trên thời gian) ---
+            
+            # w1 = 2: Phạt chênh lệch thời gian
+            diff_penalty = 2 * abs(t_pacman - t_ghost)
+            
+            # w2 = 30: Hình phạt RẤT nặng nếu Pacman đến muộn
+            late_penalty = 30 if t_pacman > t_ghost else 0
 
-        # Normalize
-        total = np.sum(self.belief_map)
-        if total > 0:
-            self.belief_map /= total
+            # w3 = 3: Phạt khoảng cách tuyệt đối của Pacman (Ưu tiên điểm chặn gần)
+            # Dùng d_pacman thay vì t_pacman để giữ cho đường đi vật lý không quá dài
+            d_pacman_cost = 3 * d_pacman 
 
-    def get_belief_target(self) -> tuple:
-        """
-        API cho Pacman: trả về vị trí có belief cao nhất
-        Dùng khi mất dấu enemy để biết nên đi tìm ở đâu
-        """
-        if np.sum(self.belief_map) <= 0:
-            return None
+            # w4 = 6: Thưởng cho giao lộ
+            junction_bonus = 6 if self._is_junction(target) else 0 
 
-        # Tìm ô có belief cao nhất
-        max_belief = np.max(self.belief_map)
-        if max_belief <= 0:
-            return None
+            # Cost: Càng nhỏ, càng tốt
+            cost = diff_penalty + late_penalty + d_pacman_cost - junction_bonus
+            score = -cost # Score: Càng lớn, càng tốt
 
-        # Lấy tất cả các ô có belief gần bằng max (trong trường hợp có nhiều ô)
-        candidates = []
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if self.belief_map[r, c] >= max_belief * 0.95:  # 95% của max
-                    candidates.append((r, c))
+            if score > best_score:
+                best_score = score
+                best_target = target
+                
+        # Giữ nguyên Fallback Logic (nếu điểm chặn tốt nhất quá xa và score tệ, quay về đuổi thẳng)
+        # Ngưỡng -35 tương đương với việc Pacman đến muộn 2 bước (late_penalty=30 + 2*diff=4)
+        if best_score < -35 and self._bfs_dist(my_pos, best_target, allow_unknown=True) > 6:
+             return enemy_pos
 
-        if not candidates:
-            return None
-
-        # Chọn ô gần nhất với last_known (nếu có)
-        if self.last_known_enemy_pos is not None:
-            candidates.sort(key=lambda pos: manhattan(pos, self.last_known_enemy_pos))
-            return candidates[0]
-
-        return candidates[0]
-
-    def get_danger_map(self) -> np.ndarray:
-        """
-        API cho Ghost: trả về danger map dựa trên belief
-        Các ô có belief cao = nguy hiểm cho Ghost
-        """
-        return self.belief_map.copy()
-
+        return best_target
 
 # ============================
 # GHOST AGENT (HIDER)
