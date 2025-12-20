@@ -1,42 +1,13 @@
 """
-agent.py – Bản LEAD HOÀN CHỈNH cho CSC14003 Project 2 (Limited Vision)
-
-✅ ĐÃ KẾT HỢP:
-1) Baseline mạnh:
-   - memory_map 21x21 {-1,0,1}
-   - visit_count + anti-loop
-   - Pacman: BFS chase / last_known / frontier scoring explore
-   - Ghost : chạy xa + vào fog + anti-loop + tránh dead-end (degree)
-
-2) Intercept (Lộc):
-   - Khi thấy enemy: không đuổi thẳng, dự đoán 2–4 bước và chọn điểm chặn
-   - Tính COST theo thời gian có pacman_speed + thưởng giao lộ
-
-3) Ghost strategy nâng cấp (Nguyên):
-   - Danger-aware: phạt ô gần Pacman (hoặc vị trí ước lượng từ belief)
-   - Occlusion: tránh đứng cùng hàng/cột trong phạm vi 5 nếu không có tường che
-
-4) Belief tracking (Tâm) + TÍCH HỢP THỰC SỰ:
-   - Cập nhật belief mỗi step
-   - Khi mất dấu: Pacman dùng belief_target để đi tìm
-   - Ghost dùng danger_map (từ belief) để né khi Pacman không visible
-
-LƯU Ý QUAN TRỌNG:
-- obs/map_state: 1=wall (luôn thấy), 0=empty (thấy trong LOS), -1=unseen (fog)
-- Không được mặc định -1 là đi được, nhưng để khám phá: agent cho phép bước vào -1 (treat as traversable, trừ tường).
-- Tối ưu thời gian: mọi thứ chạy trên 21x21 là đủ nhẹ < 1s/step.
+agent.py
 """
-
 import sys
 from pathlib import Path
 from collections import deque
 import random
 import numpy as np
-
-# Thêm thư mục src vào sys.path để import framework của Arena
 src_path = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(src_path))
-
 from agent_interface import PacmanAgent as BasePacmanAgent
 from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
@@ -258,8 +229,6 @@ class PacmanAgent(BasePacmanAgent):
             target = self._intercept_target(my_position, enemy_position)
         else:
             # Không thấy Ghost:
-            # - Nếu last_known còn "mới" thì ưu tiên
-            # - Nếu mất dấu quá lâu thì chuyển sang belief target
             if self.last_known_enemy_pos is not None:
                 stale = (self.last_seen_step is not None and (step_number - self.last_seen_step) >= 4)
                 if stale:
@@ -499,7 +468,7 @@ class PacmanAgent(BasePacmanAgent):
         return moves
 
     # ============================
-    # INTERCEPT (LỘC)
+    # INTERCEPT
     # ============================
 
     def _is_junction(self, pos: tuple) -> bool:
@@ -672,7 +641,7 @@ class GhostAgent(BaseGhostAgent):
         return deg
 
     # ============================
-    # OCCLUSION HELPER (NGUYÊN)
+    # OCCLUSION HELPER
     # ============================
 
     def _has_line_of_sight(self, pos1: tuple, pos2: tuple) -> bool:
