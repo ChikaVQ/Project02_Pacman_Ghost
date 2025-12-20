@@ -193,6 +193,7 @@ class PacmanAgent(BasePacmanAgent):
         self.rng = random.Random(seed)
 
         self.name = "Lead Pacman (Frontier + Intercept + Belief)"
+        self.last_move = Move.STAY
 
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
         # 1) Update memory
@@ -242,8 +243,15 @@ class PacmanAgent(BasePacmanAgent):
         if target is not None:
             path = self._bfs_path(my_position, target, allow_unknown=True)
             if path and len(path) >= 2:
+                # mv là hướng di chuyển (Move.UP, DOWN,...) TỪ path[0] ĐẾN path[1]
                 mv = self._move_from_to(path[0], path[1])
-                return self._pack_move_with_steps(my_position, mv)
+                
+                # Tính toán số ô đi được (1 hoặc 2) và cập nhật last_move
+                packed_move = self._pack_move_with_steps_custom(my_position, mv) 
+                
+                # CẬP NHẬT self.last_move là hướng di chuyển (packed_move[0])
+                self.last_move = packed_move[0] 
+                return packed_move
 
             # Nếu đã tới last_known mà vẫn không thấy -> bỏ
             if enemy_position is None and self.last_known_enemy_pos is not None and my_position == self.last_known_enemy_pos:
@@ -255,13 +263,22 @@ class PacmanAgent(BasePacmanAgent):
             path = self._bfs_path(my_position, best_frontier, allow_unknown=True)
             if path and len(path) >= 2:
                 mv = self._move_from_to(path[0], path[1])
-                return self._pack_move_with_steps(my_position, mv)
+                packed_move = self._pack_move_with_steps_custom(my_position, mv) 
+                
+                # CẬP NHẬT self.last_move
+                self.last_move = packed_move[0] 
+                return packed_move
 
         # 5) Fallback move
-        for mv in self._ordered_moves(my_position):
+        for mv in self._ordered_moves(my_position): 
             if self._can_step(my_position, mv):
-                return (mv, 1)
+             packed_move = self._pack_move_with_steps_custom(my_position, mv) 
+             
+             # CẬP NHẬT self.last_move
+             self.last_move = packed_move[0] 
+             return packed_move
 
+        self.last_move = Move.STAY 
         return (Move.STAY, 1)
 
     # ============================
@@ -290,20 +307,6 @@ class PacmanAgent(BasePacmanAgent):
         dr, dc = mv.value
         return self._walkable(pos[0] + dr, pos[1] + dc, allow_unknown=True)
 
-    def _pack_move_with_steps(self, pos: tuple, mv: Move):
-        steps = 0
-        r, c = pos
-        dr, dc = mv.value
-        for _ in range(self.pacman_speed):
-            nr, nc = r + dr, c + dc
-            if not self._walkable(nr, nc, allow_unknown=True):
-                break
-            steps += 1
-            r, c = nr, nc
-        if steps <= 0:
-            return (Move.STAY, 1)
-        return (mv, steps)
-
     def _move_from_to(self, a: tuple, b: tuple) -> Move:
         dr, dc = b[0] - a[0], b[1] - a[1]
         for mv, (r, c) in DIRS:
@@ -311,44 +314,180 @@ class PacmanAgent(BasePacmanAgent):
                 return mv
         return Move.STAY
 
-    def _pacman_time(self, d_pacman: int) -> int:
+    #def _pacman_time(self, d_pacman: int) -> int:
         # ceil(d / pacman_speed)
-        if d_pacman <= 0:
+     #   if d_pacman <= 0:
+      #      return 0
+       # return (d_pacman + self.pacman_speed - 1) // self.pacman_speed
+    def _bfs_time(self, start: tuple, goal: tuple, allow_unknown: bool) -> int:
+        """
+        Tính số bước thời gian (time steps) tối thiểu để Pacman đi từ start đến goal
+        theo luật: 2 bước thẳng (T=1), 1 bước quẹo (T=1).
+        """
+        if start == goal:
             return 0
-        return (d_pacman + self.pacman_speed - 1) // self.pacman_speed
+        
+        # State: (pos, last_move, time)
+        # last_move: Hướng di chuyển Pacman dùng để ĐẾN pos
+        q = deque([(start, Move.STAY, 0)]) 
+        
+        # dist: key=(pos, last_move), value=time. Cần lưu last_move để biết bước tiếp theo có phải là 'thẳng' hay không.
+        dist = {(start, Move.STAY): 0} 
+        
+        best_time = -1
+
+        while q:
+            cur, last_mv, cur_time = q.popleft()
+            
+            if best_time != -1 and cur_time >= best_time:
+                continue
+
+            # Thử tất cả các hướng đi (mv) từ cur
+            for mv in ALL_MOVES:
+                dr, dc = mv.value
+                
+                # 1. Xác định số ô và thời gian thực tế cho bước đi này
+                max_steps = 2 if mv == last_mv and mv != Move.STAY else 1
+                
+                steps = 0
+                r, c = cur
+                
+                # 2. Kiểm tra khả năng đi (walkable) và thực hiện di chuyển
+                for _ in range(max_steps):
+                    nr, nc = r + dr, c + dc
+                    if not self._walkable(nr, nc, allow_unknown):
+                        break
+                    steps += 1
+                    r, c = nr, nc
+                
+                if steps > 0:
+                    nxt = (r, c) # Vị trí mới sau khi di chuyển
+                    nxt_time = cur_time + 1 # Mỗi lần gọi step() là +1 thời gian (dù đi 1 hay 2 ô)
+                    
+                    if nxt == goal:
+                        if best_time == -1 or nxt_time < best_time:
+                            best_time = nxt_time
+                        # Tiếp tục tìm kiếm để đảm bảo tìm thấy đường đi nhanh nhất (không dùng continue ở đây)
+                        
+                    nxt_state = (nxt, mv)
+                    
+                    # 3. Cập nhật và thêm vào queue nếu tìm thấy đường đi nhanh hơn
+                    if nxt_state not in dist or nxt_time < dist[nxt_state]:
+                        dist[nxt_state] = nxt_time
+                        q.append((nxt, mv, nxt_time))
+
+        return best_time
+    def _pack_move_with_steps_custom(self, pos: tuple, mv: Move):
+        """
+        Di chuyển 2 bước nếu đi thẳng (cùng hướng last_move), 1 bước nếu quẹo.
+        Chỉ đi được qua các ô walkable.
+        """
+        r, c = pos
+        dr, dc = mv.value
+        
+        # 1. Xác định số bước dự kiến
+        if mv == self.last_move and mv != Move.STAY:
+            max_steps = 2  # Đi thẳng: 2 bước
+        else:
+            max_steps = 1  # Quẹo hoặc di chuyển lần đầu: 1 bước
+            
+        # 2. Kiểm tra khả năng đi lại thực tế (đảm bảo không đi xuyên tường)
+        steps = 0
+        current_r, current_c = r, c
+        
+        for _ in range(max_steps):
+            next_r, next_c = current_r + dr, current_c + dc
+            
+            # Kiểm tra ô tiếp theo có walkable không
+            if not self._walkable(next_r, next_c, allow_unknown=True):
+                break # Gặp tường/unwalkable: dừng lại
+            
+            steps += 1
+            current_r, current_c = next_r, next_c
+        
+        # 3. Trả về kết quả
+        if steps <= 0:
+            return (Move.STAY, 1) # Không di chuyển được: STAY
+        return (mv, steps)
 
     # ============================
     # BFS
     # ============================
 
     def _bfs_path(self, start: tuple, goal: tuple, allow_unknown: bool):
+        """
+        Tìm đường đi TỐI ƯU VỀ THỜI GIAN (Time-based BFS)
+        State: (pos, last_move)
+        """
         if start == goal:
             return [start]
-        q = deque([start])
-        parent = {start: None}
+            
+        # q: (pos, last_move)
+        q = deque([(start, Move.STAY)])
+        # parent: key=(pos, last_move), value=(parent_pos, parent_last_move)
+        # time: key=(pos, last_move), value=min_time
+        parent = {(start, Move.STAY): None}
+        time = {(start, Move.STAY): 0}
+
+        best_goal_state = None
+        min_time = float('inf')
 
         while q:
-            cur = q.popleft()
-            if cur == goal:
-                break
-            for _, (dr, dc) in DIRS:
-                nxt = (cur[0] + dr, cur[1] + dc)
-                if nxt in parent:
-                    continue
-                if not self._walkable(nxt[0], nxt[1], allow_unknown):
-                    continue
-                parent[nxt] = cur
-                q.append(nxt)
+            cur, last_mv = q.popleft()
+            cur_time = time[(cur, last_mv)]
 
-        if goal not in parent:
+            if cur == goal:
+                if cur_time < min_time:
+                    min_time = cur_time
+                    best_goal_state = (cur, last_mv)
+            
+            if cur_time >= min_time:
+                continue
+
+            for mv in ALL_MOVES:
+                dr, dc = mv.value
+                
+                max_steps = 2 if mv == last_mv and mv != Move.STAY else 1
+                
+                # Mô phỏng di chuyển thực tế (giống _pack_move_with_steps_custom)
+                steps = 0
+                r, c = cur
+                for _ in range(max_steps):
+                    nr, nc = r + dr, c + dc
+                    if not self._walkable(nr, nc, allow_unknown):
+                        break
+                    steps += 1
+                    r, c = nr, nc
+                
+                if steps > 0:
+                    nxt = (r, c)
+                    nxt_time = cur_time + 1
+                    nxt_state = (nxt, mv)
+                    
+                    # Cập nhật và thêm vào queue nếu tìm thấy đường đi nhanh hơn
+                    if nxt_state not in time or nxt_time < time[nxt_state]:
+                        time[nxt_state] = nxt_time
+                        parent[nxt_state] = (cur, last_mv)
+                        q.append(nxt_state)
+
+
+        if best_goal_state is None:
             return None
 
+        # Tái tạo đường đi từ parent
         path = []
-        cur = goal
-        while cur is not None:
-            path.append(cur)
-            cur = parent[cur]
+        cur_state = best_goal_state
+        
+        while cur_state is not None:
+            pos, mv = cur_state
+            path.append(pos)
+            cur_state = parent.get(cur_state)
+            
         path.reverse()
+        
+        # Đường đi này chỉ chứa các điểm dừng (ví dụ: [(r1, c1), (r2, c2), ...])
+        # Nếu muốn có các ô ở giữa (ví dụ: [(r1, c1), (r1+1, c1), (r1+2, c1), ...]), cần tái tạo thêm
+        # Tuy nhiên, đối với Pacman Agent, chỉ cần các điểm dừng là đủ để chọn Move tiếp theo.
         return path
 
     def _bfs_dist(self, start: tuple, goal: tuple, allow_unknown: bool) -> int:
@@ -515,17 +654,31 @@ class PacmanAgent(BasePacmanAgent):
         best_score = -float("inf")
 
         for t in potential:
-            d_pac = self._bfs_dist(my_pos, t, allow_unknown=True)
-            d_gho = ghost_dist.get(t, -1)
-            if d_pac < 0 or d_gho < 0:
+            # 💡 SỬA 1: Tính thời gian Pacman T_Pac bằng Time-based BFS
+            t_pac = self._bfs_time(my_pos, t, allow_unknown=True) 
+            
+            # SỬA 2: Lấy thời gian Ghost T_Ghost (vẫn là khoảng cách BFS)
+            t_gho = ghost_dist.get(t, -1)
+            
+            # SỬA 3: Kiểm tra tính hợp lệ
+            if t_pac < 0 or t_gho < 0:
                 continue
 
-            t_pac = self._pacman_time(d_pac)
-            t_gho = d_gho
+            # 💡 SỬA 4: Xóa hoặc bỏ qua dòng t_pac cũ
+            # t_pac = self._pacman_time(d_pac)  <- Bỏ dòng này
+
+            # Tính khoảng cách BFS thuần túy để phạt chi phí đường đi dài (d_cost)
+            d_pac_dist = self._bfs_dist(my_pos, t, allow_unknown=True)
+
+            # d_gho không đổi, t_gho = d_gho
+            # t_pac đã là thời gian thực tế
 
             diff_penalty = 2 * abs(t_pac - t_gho)
             late_penalty = 30 if t_pac > t_gho else 0
-            d_cost = 3 * d_pac
+            
+            # SỬA 5: Sử dụng khoảng cách thuần túy (d_pac_dist) cho chi phí đường đi
+            d_cost = 3 * d_pac_dist 
+            
             junction_bonus = 6 if self._is_junction(t) else 0
 
             cost = diff_penalty + late_penalty + d_cost - junction_bonus
