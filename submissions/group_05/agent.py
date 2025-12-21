@@ -1,23 +1,22 @@
 """
 agent.py (PATCHED + IMPROVED) — based on YOUR latest code, with the 5 fixes you requested.
 
-✅ Fixes applied (as you asked):
+Fixes applied:
 1) BeliefTracker._propagate() now NORMALIZES (prevents belief dying / drifting).
 2) BeliefTracker.best_guess() now RANDOM-CHOICES among top candidates (breaks deterministic loops).
 3) Pacman intercept prediction is AXIS-ONLY (no diagonal impossible targets).
 4) Tie-break reversal penalty uses the CURRENT state's last_mv (not start_last_move).
 5) 2-step momentum bonus is CONTEXT-AWARE (only strong when it actually helps; near capture it won’t overshoot).
 
-➕ Also fixed (important to stop “chasing fake”):
+Also fixed:
 6) allow_one_unknown_finish no longer “lies” about reaching target; it only marks success if the STRICT move also reaches target.
    (So Pacman won’t pick an action that doesn't actually progress.)
 7) Frontier scoring uses TIME-TURN estimate (not Manhattan), so it matches teacher rule better.
 
-Teacher rule enforced:
+Rule enforced:
 - Turn (mv != last_mv): must be 1 step.
 - Straight (mv == last_mv): may be 1 or 2 steps (agent decides).
 - Never exceed pacman_speed.
-
 Run target:
 python3 arena.py --seek example_student --hide group_05 --pacman-speed 2 --capture-distance 2 --pacman-obs-radius 5 --ghost-obs-radius 5 --step-timeout 1 --delay 0.05
 """
@@ -116,7 +115,7 @@ class BeliefTracker:
             for rr, cc in opts:
                 newb[rr, cc] += share
 
-        # ✅ FIX #1: normalize here (prevents belief dying/drifting)
+        # FIX #1: normalize here (prevents belief dying/drifting)
         s = float(newb.sum())
         if s <= 1e-9:
             # fallback uniform later in update()
@@ -141,7 +140,7 @@ class BeliefTracker:
             cands.sort(key=lambda p: manhattan(p, last_known))
             cands = cands[:8]
 
-        # ✅ FIX #2: random among candidates
+        # FIX #2: random among candidates
         return self.rng.choice(cands)
 
     def get_map(self):
@@ -310,8 +309,8 @@ class PacmanAgent(BasePacmanAgent):
 
         def tie_value(curr_pos, curr_last_mv, mv, st_requested, moved_pos, moved_steps):
             """
-            ✅ FIX #4: reversal penalty uses curr_last_mv (state), not start_last_move.
-            ✅ FIX #5: momentum bonus depends on whether it actually helps (distance & not overshoot near capture).
+            FIX #4: reversal penalty uses curr_last_mv (state), not start_last_move.
+            FIX #5: momentum bonus depends on whether it actually helps (distance & not overshoot near capture).
             """
             val = 0.0
 
@@ -368,7 +367,7 @@ class PacmanAgent(BasePacmanAgent):
                         dist[ns] = nd
                         first_action[ns] = fa
 
-                    # ✅ IMPORTANT: do NOT "fake success" with unknown peek.
+                    # IMPORTANT: do NOT "fake success" with unknown peek.
                     # allow_one_unknown_finish only relaxes STRICTNESS for scoring IF the strict move ALSO lands in target.
                     is_target = (nxt_pos in target_set)
 
@@ -405,7 +404,7 @@ class PacmanAgent(BasePacmanAgent):
     # ---------- Intercept prediction (AXIS-ONLY) ----------
     def _axis_escape_predictions(self, ghost_pos, my_pos, steps_ahead=(2, 3, 4)):
         """
-        ✅ FIX #3: predict along ONE axis only (no diagonal impossible targets).
+        FIX #3: predict along ONE axis only (no diagonal impossible targets).
         We choose axis by which delta is larger.
         """
         if ghost_pos is None:
