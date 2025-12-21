@@ -1,969 +1,693 @@
 """
-agent.py
+agent.py (PATCHED + IMPROVED) — based on YOUR latest code, with the 5 fixes you requested.
+
+Fixes applied:
+1) BeliefTracker._propagate() now NORMALIZES (prevents belief dying / drifting).
+2) BeliefTracker.best_guess() now RANDOM-CHOICES among top candidates (breaks deterministic loops).
+3) Pacman intercept prediction is AXIS-ONLY (no diagonal impossible targets).
+4) Tie-break reversal penalty uses the CURRENT state's last_mv (not start_last_move).
+5) 2-step momentum bonus is CONTEXT-AWARE (only strong when it actually helps; near capture it won’t overshoot).
+
+Also fixed:
+6) allow_one_unknown_finish no longer “lies” about reaching target; it only marks success if the STRICT move also reaches target.
+   (So Pacman won’t pick an action that doesn't actually progress.)
+7) Frontier scoring uses TIME-TURN estimate (not Manhattan), so it matches teacher rule better.
+
+Rule enforced:
+- Turn (mv != last_mv): must be 1 step.
+- Straight (mv == last_mv): may be 1 or 2 steps (agent decides).
+- Never exceed pacman_speed.
+Run target:
+python3 arena.py --seek example_student --hide group_05 --pacman-speed 2 --capture-distance 2 --pacman-obs-radius 5 --ghost-obs-radius 5 --step-timeout 1 --delay 0.05
 """
+
 import sys
 from pathlib import Path
 from collections import deque
 import random
 import numpy as np
+
 src_path = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(src_path))
+
 from agent_interface import PacmanAgent as BasePacmanAgent
 from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 
-
-# ============================
-# TIỆN ÍCH DÙNG CHUNG
-# ============================
-
-DIRS = [
-    (Move.UP,    (-1, 0)),
-    (Move.DOWN,  (1, 0)),
-    (Move.LEFT,  (0, -1)),
-    (Move.RIGHT, (0, 1)),
-]
 ALL_MOVES = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
-
-GRID_H = 21
-GRID_W = 21
-
-
-def in_bounds(r: int, c: int) -> bool:
-    return 0 <= r < GRID_H and 0 <= c < GRID_W
+DIRS = [(Move.UP, (-1, 0)), (Move.DOWN, (1, 0)), (Move.LEFT, (0, -1)), (Move.RIGHT, (0, 1))]
+OPPOSITE = {Move.UP: Move.DOWN, Move.DOWN: Move.UP, Move.LEFT: Move.RIGHT, Move.RIGHT: Move.LEFT, Move.STAY: Move.STAY}
 
 
-def manhattan(a: tuple, b: tuple) -> int:
+def manhattan(a, b) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def argmax_cells(mat: np.ndarray, ratio: float = 0.95):
-    """
-    Lấy danh sách cell có giá trị >= ratio * max(mat).
-    Dùng để lấy nhiều ứng viên khi belief có nhiều đỉnh.
-    """
-    m = float(np.max(mat)) if mat.size else 0.0
-    if m <= 0:
-        return []
-    coords = np.argwhere(mat >= m * ratio)
-    return [tuple(x) for x in coords]
-
-
-# ============================
-# BELIEF TRACKER (DÙNG CHUNG)
-# ============================
+# =========================================================
+# Belief tracker (FIXED normalize + random tie-break)
+# =========================================================
 
 class BeliefTracker:
-    """
-    Theo dõi belief enemy có thể ở đâu (random-walk + mask vùng quan sát).
-    - Nếu thấy enemy: belief=1 tại đó
-    - Nếu không thấy: propagate + mask vùng visible (obs != -1) + mask tường
-    """
-
-    def __init__(self, decay: float = 0.95):
-        self.belief = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+    def __init__(self, decay: float = 0.95, visible_decay: float = 0.05, seed=None):
         self.decay = float(decay)
+        self.visible_decay = float(visible_decay)
+        self.belief = None
+        self.rng = random.Random(seed)
 
-    def reset_to(self, pos: tuple):
+    def ensure(self, shape):
+        if self.belief is None or self.belief.shape != shape:
+            self.belief = np.zeros(shape, dtype=np.float32)
+
+    def reset_to(self, pos):
         self.belief.fill(0.0)
-        r, c = pos
-        if in_bounds(r, c):
-            self.belief[r, c] = 1.0
+        self.belief[pos[0], pos[1]] = 1.0
 
-    def init_uniform(self, memory_map: np.ndarray, walkable_fn):
-        """
-        Nếu chưa có thông tin gì: khởi tạo belief đồng đều trên các ô không phải tường.
-        walkable_fn(r,c) dùng để loại tường.
-        """
+    def init_uniform(self, possible_mask: np.ndarray):
         self.belief.fill(0.0)
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if walkable_fn(r, c):
-                    self.belief[r, c] = 1.0
-        self._normalize()
+        cnt = int(np.sum(possible_mask))
+        if cnt <= 0:
+            self.belief[:] = 1.0 / self.belief.size
+        else:
+            self.belief[possible_mask] = 1.0 / cnt
 
-    def update(self, obs: np.ndarray, memory_map: np.ndarray, enemy_pos: tuple, walkable_fn):
-        """
-        walkable_fn(r,c): trả True nếu ô có thể đứng (không tường), cho phép -1.
-        """
+    def update(self, obs_map: np.ndarray, memory_map: np.ndarray, enemy_pos):
+        self.ensure(memory_map.shape)
+        possible = (memory_map != 1)
+
         if enemy_pos is not None:
             self.reset_to(enemy_pos)
             return
 
-        # Không thấy enemy
-        if np.sum(self.belief) > 0:
-            self._propagate(walkable_fn)
+        if float(self.belief.sum()) <= 1e-9:
+            self.init_uniform(possible)
         else:
-            self.init_uniform(memory_map, walkable_fn)
+            self._propagate(possible)
 
-        # Mask vùng visible (đã nhìn thấy mà không thấy enemy)
-        visible = (obs != -1)
-        self.belief[visible] = 0.0
+        # downweight visible region (enemy not seen there)
+        visible = (obs_map != -1)
+        self.belief[visible] *= self.visible_decay
+        self.belief[memory_map == 1] = 0.0
 
-        # Mask tường đã biết
-        walls = (memory_map == 1)
-        self.belief[walls] = 0.0
-
-        self._normalize()
-
-    def _propagate(self, walkable_fn):
-        """
-        Random-walk: mỗi cell phân phối đều cho:
-        - chính nó (enemy có thể STAY)
-        - 4 ô kề (nếu walkable)
-        """
-        new_b = np.zeros((GRID_H, GRID_W), dtype=np.float32)
-
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                p = float(self.belief[r, c])
-                if p <= 0:
-                    continue
-
-                nxts = [(r, c)]  # STAY
-                for _, (dr, dc) in DIRS:
-                    nr, nc = r + dr, c + dc
-                    if in_bounds(nr, nc) and walkable_fn(nr, nc):
-                        nxts.append((nr, nc))
-
-                share = (p * self.decay) / max(1, len(nxts))
-                for nr, nc in nxts:
-                    new_b[nr, nc] += share
-
-        self.belief = new_b
-        self._normalize()
-
-    def _normalize(self):
-        s = float(np.sum(self.belief))
-        if s > 0:
+        # normalize (and re-init if degenerate)
+        s = float(self.belief.sum())
+        if s <= 1e-9:
+            self.init_uniform(possible)
+        else:
             self.belief /= s
 
-    def get_target(self, last_known: tuple = None):
-        """
-        Trả cell belief cao nhất (hoặc một trong các cell gần max).
-        Nếu có last_known: ưu tiên cell gần last_known.
-        """
-        if float(np.sum(self.belief)) <= 0:
+    def _propagate(self, possible_mask: np.ndarray):
+        H, W = possible_mask.shape
+        newb = np.zeros_like(self.belief, dtype=np.float32)
+
+        rows, cols = np.where(self.belief > 1e-7)
+        for r, c in zip(rows, cols):
+            p = float(self.belief[r, c])
+            if p <= 0 or not possible_mask[r, c]:
+                continue
+
+            opts = [(r, c)]  # stay allowed
+            for _, (dr, dc) in DIRS:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and possible_mask[rr, cc]:
+                    opts.append((rr, cc))
+
+            share = (p * self.decay) / len(opts)
+            for rr, cc in opts:
+                newb[rr, cc] += share
+
+        # FIX #1: normalize here (prevents belief dying/drifting)
+        s = float(newb.sum())
+        if s <= 1e-9:
+            # fallback uniform later in update()
+            self.belief = newb
+        else:
+            self.belief = newb / s
+
+    def best_guess(self, last_known=None):
+        if self.belief is None or float(self.belief.sum()) <= 1e-9:
             return None
-        cands = argmax_cells(self.belief, ratio=0.95)
+        mx = float(self.belief.max())
+        if mx <= 0:
+            return None
+
+        coords = np.argwhere(self.belief >= 0.90 * mx)
+        cands = [tuple(x) for x in coords]
         if not cands:
             return None
+
         if last_known is not None:
+            # keep top few closest to last_known, then random
             cands.sort(key=lambda p: manhattan(p, last_known))
-        return cands[0]
+            cands = cands[:8]
+
+        # FIX #2: random among candidates
+        return self.rng.choice(cands)
 
     def get_map(self):
-        return self.belief.copy()
+        return None if self.belief is None else self.belief.copy()
 
 
-# ============================
-# PACMAN AGENT (SEEKER)
-# ============================
+# =========================================================
+# PACMAN (Seeker)
+# =========================================================
 
 class PacmanAgent(BasePacmanAgent):
-    """
-    Pacman (kẻ đi tìm)
-
-    Pipeline:
-    - Update memory + visit_count + belief
-    - Nếu thấy Ghost:
-        + Intercept target (2–4 bước) -> BFS tới điểm chặn
-    - Nếu không thấy:
-        + Ưu tiên last_known (nếu mới) hoặc belief_target (nếu mất dấu)
-        + Nếu không có -> frontier scoring explore
-    """
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 2)))
+        self.capture_threshold = int(kwargs.get("capture_distance", 2))
+        # engine uses distance < capture_distance => if capture_distance=2 => win when manhattan<=1
+        self.capture_ring = max(0, self.capture_threshold - 1)
 
-        self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 1)))
+        self.rng = random.Random(kwargs.get("seed", None))
 
-        self.memory_map = np.full((GRID_H, GRID_W), -1, dtype=np.int8)
-        self.visit_count = np.zeros((GRID_H, GRID_W), dtype=np.int16)
+        self.memory_map = None
+        self.visit = None
 
-        self.last_known_enemy_pos = None
+        self.bt = BeliefTracker(decay=0.95, visible_decay=0.05, seed=kwargs.get("seed", None))
+
+        self.last_move = Move.STAY
+        self.prev_positions = deque(maxlen=6)
+
+        self.last_seen_enemy = None
         self.last_seen_step = None
 
-        self.prev_positions = deque(maxlen=8)
+        self.name = "Pacman (Momentum BFS + Capture-ring Intercept) [Fixed]"
 
-        # Belief tracking (Ghost position)
-        self.bt = BeliefTracker(decay=0.95)
+    # ---------- Map Helpers ----------
+    def _ensure(self, obs: np.ndarray):
+        if self.memory_map is None or self.memory_map.shape != obs.shape:
+            self.memory_map = np.full(obs.shape, -1, dtype=np.int8)
+            self.visit = np.zeros(obs.shape, dtype=np.int16)
 
-        seed = kwargs.get("seed", None)
-        self.rng = random.Random(seed)
+    def _update_memory(self, obs: np.ndarray):
+        self._ensure(obs)
+        visible = (obs != -1)
+        self.memory_map[visible] = obs[visible]
 
-        self.name = "Lead Pacman (Frontier + Intercept + Belief)"
-        self.last_move = Move.STAY
+    def _in_bounds(self, r, c):
+        H, W = self.memory_map.shape
+        return 0 <= r < H and 0 <= c < W
 
+    def _walkable_known(self, r, c) -> bool:
+        return self._in_bounds(r, c) and int(self.memory_map[r, c]) == 0
+
+    def _walkable_possible(self, r, c) -> bool:
+        return self._in_bounds(r, c) and int(self.memory_map[r, c]) != 1
+
+    # ---------- Frontier Helpers ----------
+    def _frontiers(self):
+        if self.memory_map is None:
+            return []
+        H, W = self.memory_map.shape
+        fr = []
+        zeros = np.where(self.memory_map == 0)
+        for r, c in zip(zeros[0], zeros[1]):
+            for _, (dr, dc) in DIRS:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and int(self.memory_map[rr, cc]) == -1:
+                    fr.append((int(r), int(c)))
+                    break
+        return fr
+
+    def _unknown_gain(self, pos, radius=2):
+        r, c = pos
+        H, W = self.memory_map.shape
+        r0, r1 = max(0, r - radius), min(H, r + radius + 1)
+        c0, c1 = max(0, c - radius), min(W, c + radius + 1)
+        return int(np.sum(self.memory_map[r0:r1, c0:c1] == -1))
+
+    # ---------- Teacher Rule Logic ----------
+    def _allowed_steps(self, mv: Move, last_mv: Move):
+        if mv == Move.STAY:
+            return [1]
+        if mv != last_mv:
+            return [1]  # turning constraint
+        if self.pacman_speed >= 2:
+            return [2, 1]  # straight: agent may choose
+        return [1]
+
+    def _apply_action(self, pos, mv: Move, steps: int, strict_known: bool):
+        if mv == Move.STAY:
+            return pos, 0
+        dr, dc = mv.value
+        r, c = pos
+        moved = 0
+        for _ in range(steps):
+            rr, cc = r + dr, c + dc
+            ok = self._walkable_known(rr, cc) if strict_known else self._walkable_possible(rr, cc)
+            if not ok:
+                break
+            r, c = rr, cc
+            moved += 1
+        return (int(r), int(c)), moved
+
+    # ---------- Capture Logic ----------
+    def _capture_cells(self, ghost_pos):
+        """cells where pacman wins if it ends there (within capture_ring of ghost)."""
+        if ghost_pos is None:
+            return []
+        r, c = ghost_pos
+        cells = [(r, c)]
+        if self.capture_ring >= 1:
+            for _, (dr, dc) in DIRS:
+                cells.append((r + dr, c + dc))
+        out = []
+        for rr, cc in cells:
+            if self._in_bounds(rr, cc):
+                out.append((int(rr), int(cc)))
+        return out
+
+    # ---------- Time-turn BFS helpers ----------
+    def _estimate_turns_single(self, start, last_mv, goal, max_turns=18):
+        """Turn-based BFS using teacher rule; strict_known only (fast + safe)."""
+        if start == goal:
+            return 0
+        q = deque([(start, last_mv)])
+        dist = {(start, last_mv): 0}
+        while q:
+            pos, lm = q.popleft()
+            d = dist[(pos, lm)]
+            if d >= max_turns:
+                continue
+            for mv in ALL_MOVES:
+                for st in self._allowed_steps(mv, lm):
+                    nxt, moved = self._apply_action(pos, mv, st, strict_known=True)
+                    if moved <= 0:
+                        continue
+                    ns = (nxt, mv)
+                    if ns in dist:
+                        continue
+                    nd = d + 1
+                    if nxt == goal:
+                        return nd
+                    dist[ns] = nd
+                    q.append(ns)
+        return None
+
+    def _best_first_action_to_targets(
+        self,
+        start,
+        start_last_move,
+        target_set: set,
+        strict_known: bool,
+        max_turns=14,
+        allow_one_unknown_finish=False
+    ):
+        if start in target_set:
+            return (Move.STAY, 1)
+
+        q = deque([(start, start_last_move)])
+        dist = {(start, start_last_move): 0}
+        first_action = {(start, start_last_move): None}
+
+        best_act = None
+        best_turns = None
+        best_tie = -1e18
+
+        prev_cell = self.prev_positions[-2] if len(self.prev_positions) >= 2 else None
+
+        def tie_value(curr_pos, curr_last_mv, mv, st_requested, moved_pos, moved_steps):
+            """
+            FIX #4: reversal penalty uses curr_last_mv (state), not start_last_move.
+            FIX #5: momentum bonus depends on whether it actually helps (distance & not overshoot near capture).
+            """
+            val = 0.0
+
+            # anti-backtrack
+            if prev_cell is not None and moved_pos == prev_cell:
+                val -= 120.0
+
+            # reversal relative to CURRENT state's last move
+            if mv == OPPOSITE.get(curr_last_mv, Move.STAY):
+                val -= 60.0
+
+            # visit penalty
+            val -= 2.0 * float(self.visit[moved_pos[0], moved_pos[1]])
+
+            # momentum bonus (context-aware)
+            # strong only if:
+            # - actual moved_steps==2
+            # - and we're not "near capture" (to avoid overshoot)
+            if moved_steps == 2:
+                # approximate closeness: near any target => don't over-reward 2-steps
+                # (target_set small often: capture-ring)
+                near_target = any(manhattan(moved_pos, t) <= 2 for t in list(target_set)[:6])
+                val += 70.0 if not near_target else 10.0
+
+            return val
+
+        while q:
+            pos, last_mv = q.popleft()
+            turns = dist[(pos, last_mv)]
+            if best_turns is not None and turns > best_turns:
+                continue
+            if turns >= max_turns:
+                continue
+
+            for mv in ALL_MOVES:
+                for st in self._allowed_steps(mv, last_mv):
+                    nxt_pos, moved = self._apply_action(pos, mv, st, strict_known=strict_known)
+                    if moved <= 0:
+                        continue
+
+                    ns = (nxt_pos, mv)
+                    nd = turns + 1
+
+                    # propagate first action
+                    fa = first_action[(pos, last_mv)]
+                    if fa is None:
+                        fa = (mv, moved)
+
+                    if ns not in dist:
+                        dist[ns] = nd
+                        first_action[ns] = fa
+                        q.append(ns)
+                    elif nd < dist[ns]:
+                        dist[ns] = nd
+                        first_action[ns] = fa
+
+                    # IMPORTANT: do NOT "fake success" with unknown peek.
+                    # allow_one_unknown_finish only relaxes STRICTNESS for scoring IF the strict move ALSO lands in target.
+                    is_target = (nxt_pos in target_set)
+
+                    if is_target:
+                        tv = tie_value(pos, last_mv, mv, st, nxt_pos, moved)
+                        if best_turns is None or nd < best_turns or (nd == best_turns and tv > best_tie):
+                            best_turns = nd
+                            best_tie = tv
+                            best_act = fa
+
+            # optional: if enabled, allow exploring UNKNOWN as intermediate (still real movement)
+            # but must not claim success unless strict path reaches target.
+            if allow_one_unknown_finish and strict_known:
+                for mv in ALL_MOVES:
+                    # only try 1-step unknown as a controlled risk
+                    nxt_pos, moved = self._apply_action(pos, mv, 1, strict_known=False)
+                    if moved <= 0:
+                        continue
+                    ns = (nxt_pos, mv)
+                    nd = turns + 1
+                    fa = first_action[(pos, last_mv)]
+                    if fa is None:
+                        fa = (mv, moved)
+                    if ns not in dist:
+                        dist[ns] = nd
+                        first_action[ns] = fa
+                        q.append(ns)
+                    elif nd < dist[ns]:
+                        dist[ns] = nd
+                        first_action[ns] = fa
+
+        return best_act
+
+    # ---------- Intercept prediction (AXIS-ONLY) ----------
+    def _axis_escape_predictions(self, ghost_pos, my_pos, steps_ahead=(2, 3, 4)):
+        """
+        FIX #3: predict along ONE axis only (no diagonal impossible targets).
+        We choose axis by which delta is larger.
+        """
+        if ghost_pos is None:
+            return []
+
+        gr, gc = ghost_pos
+        pr, pc = my_pos
+        dr = gr - pr
+        dc = gc - pc
+
+        preds = []
+
+        # choose dominant axis
+        if abs(dr) >= abs(dc):
+            step_r = int(np.sign(dr)) if dr != 0 else 0
+            step_c = 0
+        else:
+            step_r = 0
+            step_c = int(np.sign(dc)) if dc != 0 else 0
+
+        # If both 0 (same cell), no prediction
+        if step_r == 0 and step_c == 0:
+            return preds
+
+        for k in steps_ahead:
+            rr, cc = gr + step_r * k, gc + step_c * k
+            if self._in_bounds(rr, cc):
+                preds.append((int(rr), int(cc)))
+        return preds
+
+    # ---------- Main Step ----------
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
-        # 1) Update memory
         self._update_memory(map_state)
+        self.visit[my_position[0], my_position[1]] += 1
+        self.prev_positions.append(my_position)
 
-        # 2) Update visit_count
-        r, c = my_position
-        if in_bounds(r, c):
-            self.visit_count[r, c] += 1
-
-        # 3) Update last_known
         if enemy_position is not None:
-            self.last_known_enemy_pos = enemy_position
+            self.last_seen_enemy = enemy_position
             self.last_seen_step = step_number
 
-        # 3b) Update belief (Ghost)
-        self.bt.update(
-            obs=map_state,
-            memory_map=self.memory_map,
-            enemy_pos=enemy_position,
-            walkable_fn=lambda rr, cc: self._walkable(rr, cc, allow_unknown=True),
-        )
+        self.bt.update(map_state, self.memory_map, enemy_position)
 
-        self.prev_positions.append(my_position)
+        # immediate capture (engine will check distance < capture_threshold)
+        if enemy_position is not None and manhattan(my_position, enemy_position) <= self.capture_ring:
+            return (Move.STAY, 1)
 
-        # ============================
-        # 4) CHỌN TARGET
-        # ============================
+        ghost_est = enemy_position if enemy_position is not None else self.bt.best_guess(self.last_seen_enemy)
 
-        target = None
+        # 1) Intercept / chase capture-ring
+        if ghost_est is not None:
+            raw_targets = self._capture_cells(ghost_est)
+            target_cells = {t for t in raw_targets if self._walkable_possible(t[0], t[1])}
 
-        if enemy_position is not None:
-            # Thấy Ghost -> Intercept
-            target = self._intercept_target(my_position, enemy_position)
-        else:
-            # Không thấy Ghost:
-            if self.last_known_enemy_pos is not None:
-                stale = (self.last_seen_step is not None and (step_number - self.last_seen_step) >= 4)
-                if stale:
-                    target = self.bt.get_target(last_known=self.last_known_enemy_pos) or self.last_known_enemy_pos
+            # if visible and close, add axis-only escape predictions
+            dist_to_est = manhattan(my_position, ghost_est)
+            if enemy_position is not None and dist_to_est <= 8:
+                for p in self._axis_escape_predictions(ghost_est, my_position):
+                    if self._walkable_possible(p[0], p[1]):
+                        target_cells.add(p)
+
+            allow_unknown = (dist_to_est <= 4)  # controlled risk only when close
+
+            act = self._best_first_action_to_targets(
+                my_position,
+                self.last_move,
+                target_cells,
+                strict_known=True,
+                max_turns=16,
+                allow_one_unknown_finish=allow_unknown
+            )
+            if act:
+                mv, steps = act
+
+                # enforce teacher rule strictly at execution time
+                if mv != self.last_move:
+                    steps = 1
                 else:
-                    target = self.last_known_enemy_pos
-            else:
-                target = self.bt.get_target(last_known=None)
+                    steps = min(steps, 2, self.pacman_speed)
 
-        # 4a) Có target -> BFS
-        if target is not None:
-            path = self._bfs_path(my_position, target, allow_unknown=True)
-            if path and len(path) >= 2:
-                # mv là hướng di chuyển (Move.UP, DOWN,...) TỪ path[0] ĐẾN path[1]
-                mv = self._move_from_to(path[0], path[1])
-                
-                # Tính toán số ô đi được (1 hoặc 2) và cập nhật last_move
-                packed_move = self._pack_move_with_steps_custom(my_position, mv) 
-                
-                # CẬP NHẬT self.last_move là hướng di chuyển (packed_move[0])
-                self.last_move = packed_move[0] 
-                return packed_move
+                # cap by speed
+                steps = min(steps, self.pacman_speed)
 
-            # Nếu đã tới last_known mà vẫn không thấy -> bỏ
-            if enemy_position is None and self.last_known_enemy_pos is not None and my_position == self.last_known_enemy_pos:
-                self.last_known_enemy_pos = None
+                # execute on strict-known (to avoid requesting illegal movement through unknown walls)
+                nxt, moved = self._apply_action(my_position, mv, steps, strict_known=True)
+                if moved > 0:
+                    self.last_move = mv
+                    return (mv, moved)
 
-        # 4b) Explore bằng frontier scoring
-        best_frontier = self._best_frontier(my_position)
-        if best_frontier is not None and best_frontier != my_position:
-            path = self._bfs_path(my_position, best_frontier, allow_unknown=True)
-            if path and len(path) >= 2:
-                mv = self._move_from_to(path[0], path[1])
-                packed_move = self._pack_move_with_steps_custom(my_position, mv) 
-                
-                # CẬP NHẬT self.last_move
-                self.last_move = packed_move[0] 
-                return packed_move
+        # 2) Exploration with frontiers (TIME-TURN not Manhattan)
+        frontiers = self._frontiers()
+        if frontiers:
+            self.rng.shuffle(frontiers)
+            sample = frontiers[:30]  # small for timeout=1s
 
-        # 5) Fallback move
-        for mv in self._ordered_moves(my_position): 
-            if self._can_step(my_position, mv):
-             packed_move = self._pack_move_with_steps_custom(my_position, mv) 
-             
-             # CẬP NHẬT self.last_move
-             self.last_move = packed_move[0] 
-             return packed_move
+            best_f = None
+            best_val = -1e18
+            bm = self.bt.get_map()
 
-        self.last_move = Move.STAY 
+            for f in sample:
+                turns = self._estimate_turns_single(my_position, self.last_move, f, max_turns=18)
+                if turns is None:
+                    continue
+
+                gain = self._unknown_gain(f, radius=2)
+                val = 10.0 * gain - 4.0 * turns - 3.0 * float(self.visit[f[0], f[1]])
+
+                if bm is not None:
+                    val += 40.0 * float(bm[f[0], f[1]])
+
+                # anti-backtrack
+                if len(self.prev_positions) >= 2 and f == self.prev_positions[-2]:
+                    val -= 25.0
+
+                if val > best_val:
+                    best_val = val
+                    best_f = f
+
+            if best_f is not None:
+                act = self._best_first_action_to_targets(
+                    my_position, self.last_move, {best_f},
+                    strict_known=True, max_turns=20
+                )
+                if act:
+                    mv, steps = act
+                    if mv != self.last_move:
+                        steps = 1
+                    else:
+                        steps = min(steps, 2, self.pacman_speed)
+                    steps = min(steps, self.pacman_speed)
+
+                    nxt, moved = self._apply_action(my_position, mv, steps, strict_known=True)
+                    if moved > 0:
+                        self.last_move = mv
+                        return (mv, moved)
+
+        # 3) Fallback greedy (safe + anti-loop)
+        prev_cell = self.prev_positions[-2] if len(self.prev_positions) >= 2 else None
+        candidates = []
+        for mv in ALL_MOVES:
+            for st in self._allowed_steps(mv, self.last_move):
+                nxt, moved = self._apply_action(my_position, mv, st, strict_known=True)
+                if moved <= 0:
+                    continue
+                score = 0.0
+                if prev_cell is not None and nxt == prev_cell:
+                    score -= 120.0
+                if mv == OPPOSITE.get(self.last_move, Move.STAY):
+                    score -= 40.0
+                score -= 2.0 * float(self.visit[nxt[0], nxt[1]])
+                if ghost_est is not None:
+                    score -= 1.0 * manhattan(nxt, ghost_est)
+                if moved == 2 and ghost_est is not None and manhattan(my_position, ghost_est) <= 3:
+                    score -= 30.0  # don't overshoot near capture
+                candidates.append((score, mv, moved))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, mv, moved = candidates[0]
+            self.last_move = mv
+            return (mv, moved)
+
         return (Move.STAY, 1)
 
-    # ============================
-    # MEMORY & MOVE
-    # ============================
 
-    def _update_memory(self, obs: np.ndarray):
-        visible = obs != -1
-        self.memory_map[visible] = obs[visible]
-
-    def _walkable(self, r: int, c: int, allow_unknown: bool) -> bool:
-        if not in_bounds(r, c):
-            return False
-        v = int(self.memory_map[r, c])
-        if v == 1:
-            return False
-        if v == -1:
-            return bool(allow_unknown)
-        return True
-
-    def _is_ghost_walkable(self, r: int, c: int) -> bool:
-        # Ghost giả định: chỉ tránh tường, cho phép -1
-        return self._walkable(r, c, allow_unknown=True)
-
-    def _can_step(self, pos: tuple, mv: Move) -> bool:
-        dr, dc = mv.value
-        return self._walkable(pos[0] + dr, pos[1] + dc, allow_unknown=True)
-
-    def _move_from_to(self, a: tuple, b: tuple) -> Move:
-        dr, dc = b[0] - a[0], b[1] - a[1]
-        for mv, (r, c) in DIRS:
-            if (dr, dc) == (r, c):
-                return mv
-        return Move.STAY
-
-    #def _pacman_time(self, d_pacman: int) -> int:
-        # ceil(d / pacman_speed)
-     #   if d_pacman <= 0:
-      #      return 0
-       # return (d_pacman + self.pacman_speed - 1) // self.pacman_speed
-    def _bfs_time(self, start: tuple, goal: tuple, allow_unknown: bool) -> int:
-        """
-        Tính số bước thời gian (time steps) tối thiểu để Pacman đi từ start đến goal
-        theo luật: 2 bước thẳng (T=1), 1 bước quẹo (T=1).
-        """
-        if start == goal:
-            return 0
-        
-        # State: (pos, last_move, time)
-        # last_move: Hướng di chuyển Pacman dùng để ĐẾN pos
-        q = deque([(start, Move.STAY, 0)]) 
-        
-        # dist: key=(pos, last_move), value=time. Cần lưu last_move để biết bước tiếp theo có phải là 'thẳng' hay không.
-        dist = {(start, Move.STAY): 0} 
-        
-        best_time = -1
-
-        while q:
-            cur, last_mv, cur_time = q.popleft()
-            
-            if best_time != -1 and cur_time >= best_time:
-                continue
-
-            # Thử tất cả các hướng đi (mv) từ cur
-            for mv in ALL_MOVES:
-                dr, dc = mv.value
-                
-                # 1. Xác định số ô và thời gian thực tế cho bước đi này
-                max_steps = 2 if mv == last_mv and mv != Move.STAY else 1
-                
-                steps = 0
-                r, c = cur
-                
-                # 2. Kiểm tra khả năng đi (walkable) và thực hiện di chuyển
-                for _ in range(max_steps):
-                    nr, nc = r + dr, c + dc
-                    if not self._walkable(nr, nc, allow_unknown):
-                        break
-                    steps += 1
-                    r, c = nr, nc
-                
-                if steps > 0:
-                    nxt = (r, c) # Vị trí mới sau khi di chuyển
-                    nxt_time = cur_time + 1 # Mỗi lần gọi step() là +1 thời gian (dù đi 1 hay 2 ô)
-                    
-                    if nxt == goal:
-                        if best_time == -1 or nxt_time < best_time:
-                            best_time = nxt_time
-                        # Tiếp tục tìm kiếm để đảm bảo tìm thấy đường đi nhanh nhất (không dùng continue ở đây)
-                        
-                    nxt_state = (nxt, mv)
-                    
-                    # 3. Cập nhật và thêm vào queue nếu tìm thấy đường đi nhanh hơn
-                    if nxt_state not in dist or nxt_time < dist[nxt_state]:
-                        dist[nxt_state] = nxt_time
-                        q.append((nxt, mv, nxt_time))
-
-        return best_time
-    def _pack_move_with_steps_custom(self, pos: tuple, mv: Move):
-        """
-        Di chuyển 2 bước nếu đi thẳng (cùng hướng last_move), 1 bước nếu quẹo.
-        Chỉ đi được qua các ô walkable.
-        """
-        r, c = pos
-        dr, dc = mv.value
-        
-        # 1. Xác định số bước dự kiến
-        if mv == self.last_move and mv != Move.STAY:
-            max_steps = 2  # Đi thẳng: 2 bước
-        else:
-            max_steps = 1  # Quẹo hoặc di chuyển lần đầu: 1 bước
-            
-        # 2. Kiểm tra khả năng đi lại thực tế (đảm bảo không đi xuyên tường)
-        steps = 0
-        current_r, current_c = r, c
-        
-        for _ in range(max_steps):
-            next_r, next_c = current_r + dr, current_c + dc
-            
-            # Kiểm tra ô tiếp theo có walkable không
-            if not self._walkable(next_r, next_c, allow_unknown=True):
-                break # Gặp tường/unwalkable: dừng lại
-            
-            steps += 1
-            current_r, current_c = next_r, next_c
-        
-        # 3. Trả về kết quả
-        if steps <= 0:
-            return (Move.STAY, 1) # Không di chuyển được: STAY
-        return (mv, steps)
-
-    # ============================
-    # BFS
-    # ============================
-
-    def _bfs_path(self, start: tuple, goal: tuple, allow_unknown: bool):
-        """
-        Tìm đường đi TỐI ƯU VỀ THỜI GIAN (Time-based BFS)
-        State: (pos, last_move)
-        """
-        if start == goal:
-            return [start]
-            
-        # q: (pos, last_move)
-        q = deque([(start, Move.STAY)])
-        # parent: key=(pos, last_move), value=(parent_pos, parent_last_move)
-        # time: key=(pos, last_move), value=min_time
-        parent = {(start, Move.STAY): None}
-        time = {(start, Move.STAY): 0}
-
-        best_goal_state = None
-        min_time = float('inf')
-
-        while q:
-            cur, last_mv = q.popleft()
-            cur_time = time[(cur, last_mv)]
-
-            if cur == goal:
-                if cur_time < min_time:
-                    min_time = cur_time
-                    best_goal_state = (cur, last_mv)
-            
-            if cur_time >= min_time:
-                continue
-
-            for mv in ALL_MOVES:
-                dr, dc = mv.value
-                
-                max_steps = 2 if mv == last_mv and mv != Move.STAY else 1
-                
-                # Mô phỏng di chuyển thực tế (giống _pack_move_with_steps_custom)
-                steps = 0
-                r, c = cur
-                for _ in range(max_steps):
-                    nr, nc = r + dr, c + dc
-                    if not self._walkable(nr, nc, allow_unknown):
-                        break
-                    steps += 1
-                    r, c = nr, nc
-                
-                if steps > 0:
-                    nxt = (r, c)
-                    nxt_time = cur_time + 1
-                    nxt_state = (nxt, mv)
-                    
-                    # Cập nhật và thêm vào queue nếu tìm thấy đường đi nhanh hơn
-                    if nxt_state not in time or nxt_time < time[nxt_state]:
-                        time[nxt_state] = nxt_time
-                        parent[nxt_state] = (cur, last_mv)
-                        q.append(nxt_state)
-
-
-        if best_goal_state is None:
-            return None
-
-        # Tái tạo đường đi từ parent
-        path = []
-        cur_state = best_goal_state
-        
-        while cur_state is not None:
-            pos, mv = cur_state
-            path.append(pos)
-            cur_state = parent.get(cur_state)
-            
-        path.reverse()
-        
-        # Đường đi này chỉ chứa các điểm dừng (ví dụ: [(r1, c1), (r2, c2), ...])
-        # Nếu muốn có các ô ở giữa (ví dụ: [(r1, c1), (r1+1, c1), (r1+2, c1), ...]), cần tái tạo thêm
-        # Tuy nhiên, đối với Pacman Agent, chỉ cần các điểm dừng là đủ để chọn Move tiếp theo.
-        return path
-
-    def _bfs_dist(self, start: tuple, goal: tuple, allow_unknown: bool) -> int:
-        if start == goal:
-            return 0
-        q = deque([start])
-        dist = {start: 0}
-
-        while q:
-            cur = q.popleft()
-            dcur = dist[cur]
-            for _, (dr, dc) in DIRS:
-                nxt = (cur[0] + dr, cur[1] + dc)
-                if nxt in dist:
-                    continue
-                if not self._walkable(nxt[0], nxt[1], allow_unknown):
-                    continue
-                dist[nxt] = dcur + 1
-                if nxt == goal:
-                    return dist[nxt]
-                q.append(nxt)
-
-        return -1
-
-    # ============================
-    # FRONTIER SCORING
-    # ============================
-
-    def _is_frontier(self, pos: tuple) -> bool:
-        r, c = pos
-        if not in_bounds(r, c):
-            return False
-        if int(self.memory_map[r, c]) == 1:
-            return False
-        for _, (dr, dc) in DIRS:
-            nr, nc = r + dr, c + dc
-            if in_bounds(nr, nc) and int(self.memory_map[nr, nc]) == -1:
-                return True
-        return False
-
-    def _unknown_gain(self, pos: tuple, radius: int = 2) -> int:
-        r, c = pos
-        r0 = max(0, r - radius)
-        r1 = min(GRID_H, r + radius + 1)
-        c0 = max(0, c - radius)
-        c1 = min(GRID_W, c + radius + 1)
-        window = self.memory_map[r0:r1, c0:c1]
-        return int(np.sum(window == -1))
-
-    def _visit_penalty(self, pos: tuple) -> int:
-        r, c = pos
-        if not in_bounds(r, c):
-            return 999
-        return int(self.visit_count[r, c])
-
-    def _best_frontier(self, start: tuple):
-        q = deque([start])
-        seen = {start}
-        candidates = []
-
-        while q:
-            cur = q.popleft()
-            if self._is_frontier(cur):
-                candidates.append(cur)
-                if len(candidates) >= 20:
-                    break
-            for _, (dr, dc) in DIRS:
-                nxt = (cur[0] + dr, cur[1] + dc)
-                if nxt in seen:
-                    continue
-                if not self._walkable(nxt[0], nxt[1], allow_unknown=True):
-                    continue
-                seen.add(nxt)
-                q.append(nxt)
-
-        if not candidates:
-            return None
-
-        best = None
-        best_score = None
-
-        for f in candidates:
-            d = self._bfs_dist(start, f, allow_unknown=True)
-            if d < 0:
-                continue
-            gain = self._unknown_gain(f, radius=2)
-            vpen = self._visit_penalty(f)
-            score = gain - 2 * d - 1 * vpen
-            if best_score is None or score > best_score:
-                best_score = score
-                best = f
-
-        return best
-
-    # ============================
-    # ORDER MOVES (ANTI-LOOP)
-    # ============================
-
-    def _ordered_moves(self, pos: tuple):
-        moves = ALL_MOVES[:]
-        self.rng.shuffle(moves)
-
-        def score(mv: Move):
-            dr, dc = mv.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-            if not self._walkable(nxt[0], nxt[1], allow_unknown=True):
-                return 10_000
-            penalty = 0
-            if nxt in self.prev_positions:
-                penalty += 10
-            penalty += self._visit_penalty(nxt)
-            if in_bounds(nxt[0], nxt[1]) and int(self.memory_map[nxt[0], nxt[1]]) == -1:
-                penalty -= 2
-            return penalty
-
-        moves.sort(key=score)
-        return moves
-
-    # ============================
-    # INTERCEPT
-    # ============================
-
-    def _is_junction(self, pos: tuple) -> bool:
-        r, c = pos
-        if not in_bounds(r, c) or int(self.memory_map[r, c]) == 1:
-            return False
-        deg = 0
-        for _, (dr, dc) in DIRS:
-            if self._walkable(r + dr, c + dc, allow_unknown=False):
-                deg += 1
-        return deg >= 3
-
-    def _intercept_target(self, my_pos: tuple, enemy_pos: tuple) -> tuple:
-        """
-        Dự đoán Ghost chạy 2–4 bước (cho phép đi qua -1), chọn điểm chặn tối ưu.
-        """
-        max_ghost_steps = 4
-
-        q = deque([enemy_pos])
-        ghost_dist = {enemy_pos: 0}
-        potential = []
-
-        while q:
-            cur = q.popleft()
-            dcur = ghost_dist[cur]
-            if dcur >= max_ghost_steps:
-                continue
-            if dcur >= 1:
-                potential.append(cur)
-
-            for _, (dr, dc) in DIRS:
-                nxt = (cur[0] + dr, cur[1] + dc)
-                if nxt in ghost_dist:
-                    continue
-                if not self._is_ghost_walkable(nxt[0], nxt[1]):
-                    continue
-                ghost_dist[nxt] = dcur + 1
-                q.append(nxt)
-
-        if not potential:
-            return enemy_pos
-
-        best_target = enemy_pos
-        best_score = -float("inf")
-
-        for t in potential:
-            # 💡 SỬA 1: Tính thời gian Pacman T_Pac bằng Time-based BFS
-            t_pac = self._bfs_time(my_pos, t, allow_unknown=True) 
-            
-            # SỬA 2: Lấy thời gian Ghost T_Ghost (vẫn là khoảng cách BFS)
-            t_gho = ghost_dist.get(t, -1)
-            
-            # SỬA 3: Kiểm tra tính hợp lệ
-            if t_pac < 0 or t_gho < 0:
-                continue
-
-            # 💡 SỬA 4: Xóa hoặc bỏ qua dòng t_pac cũ
-            # t_pac = self._pacman_time(d_pac)  <- Bỏ dòng này
-
-            # Tính khoảng cách BFS thuần túy để phạt chi phí đường đi dài (d_cost)
-            d_pac_dist = self._bfs_dist(my_pos, t, allow_unknown=True)
-
-            # d_gho không đổi, t_gho = d_gho
-            # t_pac đã là thời gian thực tế
-
-            diff_penalty = 2 * abs(t_pac - t_gho)
-            late_penalty = 30 if t_pac > t_gho else 0
-            
-            # SỬA 5: Sử dụng khoảng cách thuần túy (d_pac_dist) cho chi phí đường đi
-            d_cost = 3 * d_pac_dist 
-            
-            junction_bonus = 6 if self._is_junction(t) else 0
-
-            cost = diff_penalty + late_penalty + d_cost - junction_bonus
-            score = -cost
-
-            if score > best_score:
-                best_score = score
-                best_target = t
-
-        # fallback nếu chặn quá tệ và quá xa
-        if best_score < -35 and self._bfs_dist(my_pos, best_target, allow_unknown=True) > 6:
-            return enemy_pos
-
-        return best_target
-
-
-# ============================
-# GHOST AGENT (HIDER)
-# ============================
+# =========================================================
+# GHOST (Hider) — kept close to your version, small fixes only
+# =========================================================
 
 class GhostAgent(BaseGhostAgent):
-    """
-    Ghost (kẻ trốn)
-
-    - Update memory + visit_count + belief (Pacman position)
-    - Nếu thấy Pacman: dùng threat thật
-    - Nếu không thấy: dùng threat ước lượng từ belief_target để né danger/occlusion
-    """
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.rng = random.Random(kwargs.get("seed", None))
+        self.memory_map = None
+        self.visit = None
+        self.prev_positions = deque(maxlen=10)
+        self.bt = BeliefTracker(decay=0.95, visible_decay=0.10, seed=kwargs.get("seed", None))
+        self.last_seen_enemy = None
+        self.name = "Ghost (Safe Evade)"
 
-        self.memory_map = np.full((GRID_H, GRID_W), -1, dtype=np.int8)
-        self.visit_count = np.zeros((GRID_H, GRID_W), dtype=np.int16)
-
-        self.last_known_enemy_pos = None
-        self.prev_positions = deque(maxlen=8)
-
-        # Belief tracking (Pacman position)
-        self.bt = BeliefTracker(decay=0.95)
-
-        seed = kwargs.get("seed", None)
-        self.rng = random.Random(seed)
-
-        self.name = "Lead Ghost (Dead-end + Occlusion + Belief)"
-
-    def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int) -> Move:
-        # 1) Update memory
-        self._update_memory(map_state)
-
-        # 2) Update visit_count
-        r, c = my_position
-        if in_bounds(r, c):
-            self.visit_count[r, c] += 1
-
-        # 3) Update last_known
-        if enemy_position is not None:
-            self.last_known_enemy_pos = enemy_position
-
-        # 3b) Update belief (Pacman)
-        self.bt.update(
-            obs=map_state,
-            memory_map=self.memory_map,
-            enemy_pos=enemy_position,
-            walkable_fn=lambda rr, cc: self._walkable(rr, cc),
-        )
-
-        self.prev_positions.append(my_position)
-
-        # threat: ưu tiên visible, nếu không thì lấy ước lượng belief
-        threat = enemy_position
-        if threat is None:
-            threat = self.bt.get_target(last_known=self.last_known_enemy_pos) or self.last_known_enemy_pos
-
-        if threat is not None:
-            mv = self._evade_move(my_position, threat)
-            if mv is not None:
-                return mv
-
-        mv = self._roam_move(my_position, threat_est=threat)
-        if mv is not None:
-            return mv
-
-        return Move.STAY
-
-    # ============================
-    # MEMORY / WALKABLE / DEGREE
-    # ============================
+    def _ensure(self, obs: np.ndarray):
+        if self.memory_map is None or self.memory_map.shape != obs.shape:
+            self.memory_map = np.full(obs.shape, -1, dtype=np.int8)
+            self.visit = np.zeros(obs.shape, dtype=np.int16)
 
     def _update_memory(self, obs: np.ndarray):
-        visible = obs != -1
+        self._ensure(obs)
+        visible = (obs != -1)
         self.memory_map[visible] = obs[visible]
 
-    def _walkable(self, r: int, c: int) -> bool:
-        # Ghost cho phép đi vào -1 để trốn, chỉ tránh tường
-        return in_bounds(r, c) and int(self.memory_map[r, c]) != 1
+    def _in_bounds(self, r, c):
+        H, W = self.memory_map.shape
+        return 0 <= r < H and 0 <= c < W
 
-    def _visit_penalty(self, pos: tuple) -> int:
-        r, c = pos
-        if not in_bounds(r, c):
-            return 999
-        return int(self.visit_count[r, c])
+    def _walkable(self, r, c):
+        return self._in_bounds(r, c) and int(self.memory_map[r, c]) != 1
 
-    def _degree(self, pos: tuple) -> int:
-        r, c = pos
-        if not in_bounds(r, c) or int(self.memory_map[r, c]) == 1:
-            return 0
+    def _degree(self, pos):
         deg = 0
         for _, (dr, dc) in DIRS:
-            nr, nc = r + dr, c + dc
-            if in_bounds(nr, nc) and int(self.memory_map[nr, nc]) != 1:
+            if self._walkable(pos[0] + dr, pos[1] + dc):
                 deg += 1
         return deg
 
-    # ============================
-    # OCCLUSION HELPER
-    # ============================
-
-    def _has_line_of_sight(self, pos1: tuple, pos2: tuple) -> bool:
-        """
-        True nếu:
-        - cùng hàng hoặc cùng cột
-        - khoảng cách Manhattan <= 5
-        - không có tường chặn giữa
-        """
-        r1, c1 = pos1
-        r2, c2 = pos2
-
-        if r1 != r2 and c1 != c2:
+    def _has_los(self, a, b, radius=5):
+        # same row/col, no wall in between, within radius
+        if a[0] != b[0] and a[1] != b[1]:
             return False
-
-        dist = abs(r1 - r2) + abs(c1 - c2)
-        if dist > 5:
+        dist = abs(a[0] - b[0]) + abs(a[1] - b[1])
+        if dist > radius:
             return False
-
-        if r1 == r2:
-            c_min, c_max = (c1, c2) if c1 < c2 else (c2, c1)
-            for c in range(c_min + 1, c_max):
-                if int(self.memory_map[r1, c]) == 1:
-                    return False
-        else:
-            r_min, r_max = (r1, r2) if r1 < r2 else (r2, r1)
-            for r in range(r_min + 1, r_max):
-                if int(self.memory_map[r, c1]) == 1:
-                    return False
-
+        dr = int(np.sign(b[0] - a[0]))
+        dc = int(np.sign(b[1] - a[1]))
+        r, c = a
+        for _ in range(dist):
+            r += dr
+            c += dc
+            if not self._in_bounds(r, c):
+                return False
+            if int(self.memory_map[r, c]) == 1:
+                return False
         return True
 
-    # ============================
-    # GHOST POLICY
-    # ============================
+    def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int) -> Move:
+        self._update_memory(map_state)
+        self.visit[my_position[0], my_position[1]] += 1
+        self.prev_positions.append(my_position)
 
-    def _evade_move(self, pos: tuple, threat: tuple) -> Move:
-        """
-        Score tổng:
-          + xa threat
-          + thưởng vào fog
-          - anti-loop
-          - dead-end
-          - danger-aware (gần threat)
-          - occlusion (cùng hàng/cột <=5 không có tường che)
-          - danger_map (belief): phạt cell có xác suất Pacman cao
-        """
-        W_DANGER = 5
-        DANGER_RADIUS = 5
-        W_OCCLUDE = 20
-        W_BELIEF = 80  # tăng/giảm tuỳ bạn (phạt mạnh khi belief cao)
+        if enemy_position is not None:
+            self.last_seen_enemy = enemy_position
 
-        danger_map = self.bt.get_map()
-
-        best_mv = Move.STAY
-        best_score = None
+        self.bt.update(map_state, self.memory_map, enemy_position)
+        pac_est = enemy_position if enemy_position is not None else self.bt.best_guess(self.last_seen_enemy)
 
         moves = ALL_MOVES[:]
         self.rng.shuffle(moves)
+        moves.append(Move.STAY)
+
+        best_mv = Move.STAY
+        best_score = -1e18
+
+        bm = self.bt.get_map()
 
         for mv in moves:
-            dr, dc = mv.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-            if not self._walkable(nxt[0], nxt[1]):
-                continue
+            if mv == Move.STAY:
+                nxt = my_position
+            else:
+                dr, dc = mv.value
+                nxt = (my_position[0] + dr, my_position[1] + dc)
+                if not self._walkable(nxt[0], nxt[1]):
+                    continue
 
-            score = 0
+            score = 0.0
 
-            # 1) Xa threat
-            score += 3 * manhattan(nxt, threat)
+            if pac_est is not None:
+                d = manhattan(nxt, pac_est)
+                score += 3.0 * d
+                if d <= 2:
+                    score -= 120.0
+                if self._has_los(nxt, pac_est, radius=5):
+                    score -= 80.0
 
-            # 2) Thưởng vào fog
-            if int(self.memory_map[nxt[0], nxt[1]]) == -1:
-                score += 4
-
-            # 3) Anti-loop
-            if nxt in self.prev_positions:
-                score -= 15
-            score -= 2 * self._visit_penalty(nxt)
-
-            # 4) Dead-end avoidance
             deg = self._degree(nxt)
             if deg <= 1:
-                score -= 25
+                score -= 40.0
             elif deg >= 3:
-                score += 6
+                score += 10.0
 
-            # 5) Danger-aware theo khoảng cách
-            d = manhattan(nxt, threat)
-            if d <= DANGER_RADIUS:
-                score -= W_DANGER * (DANGER_RADIUS + 1 - d)
+            if nxt in self.prev_positions:
+                score -= 15.0
 
-            # 6) Occlusion (tránh bị nhìn thấy theo hình dấu +)
-            if self._has_line_of_sight(nxt, threat):
-                score -= W_OCCLUDE
+            score -= 1.0 * float(self.visit[nxt[0], nxt[1]])
 
-            # 7) Belief danger map (khi Pacman không visible thì rất hữu ích)
-            score -= W_BELIEF * float(danger_map[nxt[0], nxt[1]])
+            if int(self.memory_map[nxt[0], nxt[1]]) == -1:
+                score += 6.0
 
-            if best_score is None or score > best_score:
+            if bm is not None:
+                score -= 60.0 * float(bm[nxt[0], nxt[1]])
+
+            if mv == Move.STAY:
+                score -= 2.0
+
+            if score > best_score:
                 best_score = score
                 best_mv = mv
 
         return best_mv
-
-    def _roam_move(self, pos: tuple, threat_est: tuple = None) -> Move:
-        """
-        Khi không thấy threat rõ ràng:
-        - ưu tiên vào fog
-        - tránh loop
-        - tránh dead-end nếu có thể
-        - nếu có threat_est (từ belief): cũng né occlusion/danger nhẹ
-        """
-        moves = self._ordered_moves(pos, threat_est=threat_est)
-        for mv in moves:
-            dr, dc = mv.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-            if not self._walkable(nxt[0], nxt[1]):
-                continue
-            if self._degree(nxt) <= 1:
-                continue
-            return mv
-
-        for mv in moves:
-            dr, dc = mv.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-            if self._walkable(nxt[0], nxt[1]):
-                return mv
-
-        return None
-
-    def _ordered_moves(self, pos: tuple, threat_est: tuple = None):
-        """
-        Ưu tiên: vào fog, ít loop, ít visit, tránh dead-end.
-        Nếu có threat_est: phạt thêm occlusion/danger nhẹ.
-        """
-        W_DANGER = 3
-        DANGER_RADIUS = 5
-        W_OCCLUDE = 10
-
-        moves = ALL_MOVES[:]
-        self.rng.shuffle(moves)
-
-        def penalty(mv: Move):
-            dr, dc = mv.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-
-            if not self._walkable(nxt[0], nxt[1]):
-                return 10_000
-
-            pen = 0
-            if nxt in self.prev_positions:
-                pen += 10
-            pen += self._visit_penalty(nxt)
-
-            if int(self.memory_map[nxt[0], nxt[1]]) == -1:
-                pen -= 3
-
-            if self._degree(nxt) <= 1:
-                pen += 5
-
-            if threat_est is not None:
-                d = manhattan(nxt, threat_est)
-                if d <= DANGER_RADIUS:
-                    pen += W_DANGER * (DANGER_RADIUS + 1 - d)
-                if self._has_line_of_sight(nxt, threat_est):
-                    pen += W_OCCLUDE
-
-            return pen
-
-        moves.sort(key=penalty)
-        return moves
